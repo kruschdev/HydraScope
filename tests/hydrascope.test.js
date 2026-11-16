@@ -430,3 +430,41 @@ test('Workspace-scoped MCP ingestion compiles sibling repos, captures envOr/envI
     assert.equal(resetAttempt.ok, true);
     assert.equal(resetAttempt.data.workspaceName, 'fintech-core');
 });
+
+test('Python src-layout intra-repo imports and ADK YAML !include / config_path edges compile into structural IMPACTS graph', () => {
+    const tmpPy = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-py-adk-'));
+    try {
+        fs.mkdirSync(path.join(tmpPy, 'src', 'pkg'), { recursive: true });
+        fs.mkdirSync(path.join(tmpPy, 'bundle', 'prompts'), { recursive: true });
+        fs.mkdirSync(path.join(tmpPy, 'bundle', 'sub_agents'), { recursive: true });
+        fs.mkdirSync(path.join(tmpPy, 'tests'), { recursive: true });
+
+        fs.writeFileSync(
+            path.join(tmpPy, 'src', 'pkg', 'validator.py'),
+            'def validate_bundle_dir(path):\n    return True\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpPy, 'tests', 'test_validator.py'),
+            'import pytest\nfrom pkg.validator import validate_bundle_dir\n\ndef test_ok():\n    assert validate_bundle_dir(".")\n'
+        );
+        fs.writeFileSync(path.join(tmpPy, 'bundle', 'prompts', 'system.md'), '# Root Prompt\nStay grounded.\n');
+        fs.writeFileSync(
+            path.join(tmpPy, 'bundle', 'sub_agents', 'auditor.yaml'),
+            'name: patch_auditor\ninstruction: !include ../prompts/system.md\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpPy, 'bundle', 'agent.yaml'),
+            'name: swe_root_agent\ninstruction: !include prompts/system.md\ntools:\n  - agent_tool:\n      config_path: sub_agents/auditor.yaml\n'
+        );
+
+        const res = compileDirectoryToGraph(tmpPy);
+        assert.equal(res.ok, true);
+        const edgePairs = new Set(res.data.edges.map((e) => `${e.from}->${e.to}`));
+        assert.ok(edgePairs.has('file:src/pkg/validator.py->file:tests/test_validator.py'));
+        assert.ok(edgePairs.has('doc:bundle/prompts/system.md->file:bundle/agent.yaml'));
+        assert.ok(edgePairs.has('file:bundle/sub_agents/auditor.yaml->file:bundle/agent.yaml'));
+        assert.ok(edgePairs.has('doc:bundle/prompts/system.md->file:bundle/sub_agents/auditor.yaml'));
+    } finally {
+        fs.rmSync(tmpPy, { recursive: true, force: true });
+    }
+});

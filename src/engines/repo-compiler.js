@@ -30,9 +30,10 @@ const SKIPPED_DIRS = new Set([
     'data',
 ]);
 
-const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py']);
+const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.yaml', '.yml']);
 const MARKDOWN_EXTENSIONS = new Set(['.md', '.mdx']);
 const ENV_TEMPLATE_NAMES = new Set(['.env.example', '.env.sample', '.env.template']);
+const SKIPPED_FILENAMES = new Set(['pnpm-lock.yaml', 'yarn.lock', 'docker-compose.override.yml']);
 
 const CODE_PROBE_EXTS = [
     '',
@@ -148,6 +149,19 @@ function extractCodeSymbols(content, filePath = '') {
         return uniqueStrings(symbols);
     }
 
+    if (filePath.endsWith('.yaml') || filePath.endsWith('.yml')) {
+        const yamlNameRe = /^name\s*:\s*['"]?([A-Za-z_][\w-]*)['"]?\s*$/gm;
+        let m;
+        while ((m = yamlNameRe.exec(src)) !== null) {
+            symbols.push(m[1]);
+        }
+        const yamlTopKeyRe = /^([A-Za-z_][\w-]*)\s*:/gm;
+        while ((m = yamlTopKeyRe.exec(src)) !== null) {
+            symbols.push(m[1]);
+        }
+        return uniqueStrings(symbols);
+    }
+
     const esExportDeclRe = /\bexport\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)/g;
     let match;
     while ((match = esExportDeclRe.exec(src)) !== null) {
@@ -203,6 +217,39 @@ function extractRelativeImports(content, filePath = '') {
             const modTail = dotMatch[2].replace(/\./g, '/');
             const upPrefix = dots === 1 ? './' : '../'.repeat(dots - 1);
             specifiers.push(`${upPrefix}${modTail}`);
+        }
+        const pyAbsFromRe = /^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+([^\r\n#]+)/gm;
+        while ((m = pyAbsFromRe.exec(src)) !== null) {
+            const modName = m[1];
+            specifiers.push(`py:${modName}`);
+            for (const item of m[2].split(',')) {
+                const sub = item.trim().split(/\s+as\s+/)[0].trim();
+                if (/^[A-Za-z_]\w*$/.test(sub)) {
+                    specifiers.push(`py:${modName}.${sub}`);
+                }
+            }
+        }
+        const pyImportRe = /^\s*import\s+([A-Za-z_][A-Za-z0-9_.,\s]*)/gm;
+        while ((m = pyImportRe.exec(src)) !== null) {
+            for (const part of m[1].split(',')) {
+                const modName = part.trim().split(/\s+as\s+/)[0].trim();
+                if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) {
+                    specifiers.push(`py:${modName}`);
+                }
+            }
+        }
+        return uniqueStrings(specifiers);
+    }
+
+    if (filePath.endsWith('.yaml') || filePath.endsWith('.yml')) {
+        const yamlIncludeRe = /!include\s+['"]?([^\s'"#]+)['"]?/g;
+        let m;
+        while ((m = yamlIncludeRe.exec(src)) !== null) {
+            specifiers.push(`yaml:${m[1]}`);
+        }
+        const yamlPathKeyRe = /\b(?:config_path|prompt_path|template_path|schema_path)\s*:\s*['"]?([^\s'"#]+)['"]?/g;
+        while ((m = yamlPathKeyRe.exec(src)) !== null) {
+            specifiers.push(`yaml:${m[1]}`);
         }
         return uniqueStrings(specifiers);
     }
@@ -283,11 +330,46 @@ function extractDefinedEnvKeys(content) {
  * @param {Map<string, object>} codeByPath - Lookup map from normalized path to GraphNode
  * @returns {object|null}
  */
-function resolveImportedCodeNode(importerPath, specifier, codeByPath) {
+function resolveImportedCodeNode(importerPath, specifier, codeByPath, nodeByPath = codeByPath) {
     const cleanSpec = String(specifier || '').split('?')[0].split('#')[0].trim();
-    if (!cleanSpec.startsWith('.')) return null;
+    if (!cleanSpec) return null;
 
     const baseDir = path.posix.dirname(importerPath || '.');
+
+    if (cleanSpec.startsWith('py:')) {
+        const modPath = cleanSpec.slice(3).replace(/\./g, '/').replace(/^\/+|\/+$/g, '');
+        if (!modPath) return null;
+        const pyCandidates = [
+            `${modPath}.py`,
+            `${modPath}/__init__.py`,
+            `src/${modPath}.py`,
+            `src/${modPath}/__init__.py`,
+            path.posix.normalize(path.posix.join(baseDir, `${modPath}.py`)),
+            path.posix.normalize(path.posix.join(baseDir, `${modPath}/__init__.py`)),
+        ];
+        for (const candidate of pyCandidates) {
+            const hit = codeByPath.get(candidate);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    if (cleanSpec.startsWith('yaml:')) {
+        const relRef = cleanSpec.slice(5).replace(/^\.\//, '').replace(/^\/+/, '');
+        if (!relRef) return null;
+        const yamlCandidates = [
+            path.posix.normalize(path.posix.join(baseDir, relRef)),
+            path.posix.normalize(relRef),
+        ];
+        for (const candidate of yamlCandidates) {
+            const hit = nodeByPath.get(candidate) || codeByPath.get(candidate);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    if (!cleanSpec.startsWith('.')) return null;
+
     const joined = path.posix.normalize(path.posix.join(baseDir, cleanSpec));
     const candidates = new Set([joined]);
 
@@ -331,6 +413,7 @@ export function compileArtifactsToGraph(artifacts = [], { workspaceName = 'finte
 
     const nodeById = new Map();
     const codeByPath = new Map();
+    const nodeByPath = new Map();
     const envKeyToNodeIds = new Map();
     const rawMetaById = new Map();
     const nodes = [];
@@ -381,6 +464,9 @@ export function compileArtifactsToGraph(artifacts = [], { workspaceName = 'finte
             explicitImpactsIds: uniqueStrings(raw.explicitImpactsIds),
         });
 
+        if (relPath) {
+            nodeByPath.set(relPath, node);
+        }
         if (kind === 'code' && relPath) {
             codeByPath.set(relPath, node);
         }
@@ -434,7 +520,7 @@ export function compileArtifactsToGraph(artifacts = [], { workspaceName = 'finte
         if (node.kind === 'code') {
             const relImports = extractRelativeImports(node.content, node.path);
             for (const spec of relImports) {
-                const dependencyNode = resolveImportedCodeNode(node.path, spec, codeByPath);
+                const dependencyNode = resolveImportedCodeNode(node.path, spec, codeByPath, nodeByPath);
                 if (dependencyNode) {
                     // File `node` imports `dependencyNode`, so mutating `dependencyNode` impacts caller `node`.
                     addEdge(
@@ -811,6 +897,7 @@ export function compileDirectoryToGraph(
             if (!entry.isFile()) continue;
 
             const lowerName = name.toLowerCase();
+            if (SKIPPED_FILENAMES.has(lowerName)) continue;
             const ext = path.extname(lowerName);
             const isEnvTemplate =
                 ENV_TEMPLATE_NAMES.has(lowerName) ||
