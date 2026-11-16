@@ -169,6 +169,8 @@ export async function buildServer({
                 serveDistFile(ctx.res, 'assets/app.js', 'application/javascript; charset=utf-8'),
             'GET /assets/app.css': (ctx) =>
                 serveDistFile(ctx.res, 'assets/app.css', 'text/css; charset=utf-8'),
+            'GET /og-card.png': (ctx) =>
+                serveDistFile(ctx.res, 'og-card.png', 'image/png'),
             'GET /favicon.svg': (ctx) => sendStaticAsset(ctx.res, FAVICON_SVG, 'image/svg+xml'),
 
             'GET /api/state': async () => runtime.getState(),
