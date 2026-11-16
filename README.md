@@ -2,6 +2,10 @@
 
 **Live Agent Context Layer (Skills, 64 MCP Tool Definitions, Resolved Entities, and Multi-Hop AST/ADR Lineage) Built on Self-Hosted HydraDB (`v0.4.0`)**
 
+[**Launch Live Demo (`https://hydrascope.krusch.dev`)**](https://hydrascope.krusch.dev) · [**Read Architecture Write-Up (`krusch.dev`)**](https://krusch.dev/articles/hydrascope-agent-context-on-hydradb)
+
+![HydraScope 3-Tab Prompt-First UI](./docs/hydrascope-ui.jpg)
+
 Most agent stacks preload dozens of MCP tool schemas into every prompt window (`12,000+` tokens before Turn 1) or bolt on a flat cosine vector store that retrieves deprecated v1 tools, misses mandatory post-check tools that share zero vocabulary with the user prompt, and repeats entity-lookup round-trips on every run.
 
 I built **HydraScope** on the open-source **HydraDB (`v0.4.0`)** graph engine ([`hydra-db/hydradb`](https://github.com/hydra-db/hydradb)) as a live, self-sharpening context store for AI agents. HydraScope stores an agent's **Skills**, **MCP Tool Definitions**, **Resolved Entities**, and **Code/ADR Lineage** in HydraDB, traverses only the structural subgraph each task requires, and writes newly resolved entity aliases and co-executed tool paths back into HydraDB after every run.
