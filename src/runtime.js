@@ -201,8 +201,9 @@ export async function createHydraScopeRuntime(options = {}) {
         return scrubSensitiveStrings(res);
     }
 
-    async function ingestDirectory(targetDir) {
-        if (!targetDir || String(targetDir).trim() === 'reset') {
+    async function ingestDirectory(targetDir, { allowExternalPaths = false } = {}) {
+        const cleanTarget = String(targetDir || '').trim();
+        if (!cleanTarget || cleanTarget === 'reset') {
             activeGraph = compileArtifactsToGraph(FINTECH_BENCHMARK_CORPUS, {
                 workspaceName: 'fintech-core'
             });
@@ -226,7 +227,19 @@ export async function createHydraScopeRuntime(options = {}) {
             });
         }
 
-        const resolved = path.resolve(String(targetDir).trim());
+        const resolved = path.resolve(config.projectRoot, cleanTarget);
+        if (
+            !allowExternalPaths &&
+            resolved !== config.projectRoot &&
+            !resolved.startsWith(config.projectRoot + path.sep)
+        ) {
+            return errorEnvelope(
+                'PATH_OUTSIDE_WORKSPACE',
+                'HTTP directory compilation is restricted to paths within the project workspace (e.g. "." or "./src"). Use the local CLI (`hydrascope ingest <dir>`) for external paths.',
+                null,
+                'hydrascope.ingest_dir'
+            );
+        }
         const compiled = compileDirectoryToGraph(resolved);
         if (!compiled.ok) {
             return scrubSensitiveStrings(compiled);

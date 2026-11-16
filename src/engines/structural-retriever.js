@@ -83,9 +83,11 @@ const REVERSE_TRAVERSAL_TYPES = new Set([
  * @param {string} text
  * @returns {number}
  */
+const UTF8_ENCODER = new TextEncoder();
+
 export function estimateStructuralTokens(text) {
     if (!text) return 0;
-    return Math.ceil(Buffer.byteLength(String(text), 'utf8') / 4);
+    return Math.ceil(UTF8_ENCODER.encode(String(text)).byteLength / 4);
 }
 
 /**
@@ -702,7 +704,7 @@ function formatCompactNodeExcerpt(node, maxTokens) {
     for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
-        const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+        const lineBytes = UTF8_ENCODER.encode(line).byteLength + 1;
         if (usedBytes + lineBytes > maxBytes) break;
         kept.push(line);
         usedBytes += lineBytes;

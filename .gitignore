@@ -1,6 +1,8 @@
 node_modules/
 client/node_modules/
 client/dist/
+src/edge/generated-edge-snapshot.json
+.wrangler/
 .agent/
 data/
 logs/
@@ -9,3 +11,8 @@ logs/
 !.env.example
 *.log
 .DS_Store
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example

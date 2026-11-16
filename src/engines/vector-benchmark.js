@@ -340,7 +340,7 @@ export async function queryVectorTopK(
     const rawContext = contextSections.join('\n\n');
     const maxBytes = effectiveBudget * 4;
     const contextText =
-        Buffer.byteLength(rawContext, 'utf8') > maxBytes
+        new TextEncoder().encode(rawContext).byteLength > maxBytes
             ? `${rawContext.slice(0, Math.max(64, maxBytes - 16))}...`
             : rawContext;
     const tokenCount = selectedChunks.length === 0 ? 0 : Math.min(effectiveBudget, estimateStructuralTokens(contextText));

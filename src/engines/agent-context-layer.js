@@ -17,8 +17,10 @@ import {
 } from '@krusch/toolkit/embeddings';
 import { surrogateVertexId } from '../connectors/hydradb-client.js';
 
+const UTF8_ENCODER = new TextEncoder();
+
 function estimateTokens(text) {
-    return Math.max(1, Math.ceil(Buffer.byteLength(String(text || ''), 'utf8') / 4));
+    return Math.max(1, Math.ceil(UTF8_ENCODER.encode(String(text || '')).byteLength / 4));
 }
 
 function buildHashedLexicalVector(text, dims = 256) {

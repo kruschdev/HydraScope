@@ -76,7 +76,7 @@ export const cli = defineCli({
             async run({ positionals, values, io }) {
                 const targetDir = positionals[0] || process.cwd();
                 const runtime = await createHydraScopeRuntime();
-                const res = await runtime.ingestDirectory(targetDir);
+                const res = await runtime.ingestDirectory(targetDir, { allowExternalPaths: true });
                 if (!values.json && res.ok) {
                     io.stdout(res.summary);
                 }
