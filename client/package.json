@@ -1,0 +1,20 @@
+{
+  "name": "hydrascope-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b8bc7506bc4cf5c9ccb2a7ae76ae171e98ce99ad.tar.gz",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.0",
+    "vite": "^6.0.0"
+  }
+}

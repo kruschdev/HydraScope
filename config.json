@@ -1,0 +1,6 @@
+{
+  "port": 4190,
+  "serviceName": "hydrascope",
+  "dbPath": "./data/app.db",
+  "logDir": "./logs"
+}
