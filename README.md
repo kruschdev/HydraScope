@@ -111,14 +111,17 @@ node bin/hydrascope.js load --requests 64 --concurrency 8
 node bin/hydrascope.js query "Update partner fee rounding in calculatePartnerFee"
 ```
 
-Attach to Claude Code, Cursor, or Antigravity via stdio MCP:
+Attach to Claude Code, Cursor, or Antigravity via stdio MCP (`HYDRASCOPE_WORKSPACE_ROOT` defaults to `process.cwd()` so `hydrascope_ingest_directory` can compile any repository inside your active workspace):
 
 ```json
 {
   "mcpServers": {
     "hydrascope": {
       "command": "node",
-      "args": ["/path/to/hydrascope/src/mcp/hydrascope-mcp.js"]
+      "args": ["/path/to/hydrascope/src/mcp/hydrascope-mcp.js"],
+      "env": {
+        "HYDRASCOPE_WORKSPACE_ROOT": "/path/to/your/workspace"
+      }
     }
   }
 }

@@ -163,7 +163,8 @@ export const HYDRASCOPE_MCP_TOOLS = Object.freeze([
             properties: {
                 targetDir: {
                     type: 'string',
-                    description: 'Absolute or workspace-relative directory path to compile.'
+                    description:
+                        'Absolute or workspace-relative directory path to compile, or "reset" to restore the default FinTech benchmark graph.'
                 }
             },
             required: ['targetDir']
@@ -270,6 +271,7 @@ function isDirectEntrypoint(metaUrl, argvEntry) {
 
 if (isDirectEntrypoint(import.meta.url, process.argv[1])) {
     const { createHydraScopeRuntime } = await import('../runtime.js');
-    const runtime = await createHydraScopeRuntime();
+    const workspaceRoot = String(process.env.HYDRASCOPE_WORKSPACE_ROOT || process.cwd()).trim();
+    const runtime = await createHydraScopeRuntime(workspaceRoot ? { projectRoot: workspaceRoot } : {});
     await createHydraScopeMcp({ runtime, connect: true });
 }

@@ -247,6 +247,11 @@ function extractEnvReads(content) {
         keys.push(m[1] || m[2]);
     }
 
+    const toolkitEnvRe = /\b(?:envOr|envInt|envBool)\s*\(\s*['"]([A-Z][A-Z0-9_]{1,80})['"]/g;
+    while ((m = toolkitEnvRe.exec(src)) !== null) {
+        keys.push(m[1]);
+    }
+
     return uniqueStrings(keys);
 }
 

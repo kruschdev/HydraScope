@@ -122,7 +122,8 @@ export const cli = defineCli({
             summary: 'Start the HydraScope stdio MCP server',
             options: {},
             async run() {
-                const runtime = await createHydraScopeRuntime();
+                const workspaceRoot = String(process.env.HYDRASCOPE_WORKSPACE_ROOT || process.cwd()).trim();
+                const runtime = await createHydraScopeRuntime(workspaceRoot ? { projectRoot: workspaceRoot } : {});
                 await createHydraScopeMcp({ runtime, connect: true });
                 return new Promise(() => {});
             }

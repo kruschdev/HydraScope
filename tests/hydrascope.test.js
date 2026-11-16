@@ -388,3 +388,45 @@ test('MCP server & hardened HTTP lifecycle: workspace compile/reset, date guard,
     assert.equal(dirCompiled.ok, true);
     assert.ok(dirCompiled.data.nodes.length >= 4);
 });
+
+test('Workspace-scoped MCP ingestion compiles sibling repos, captures envOr/envInt/envBool edges, and preserves SEC-03 boundary', async (t) => {
+    const tmpMono = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-mono-'));
+    const tmpOutside = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-outside-'));
+    t.after(() => {
+        fs.rmSync(tmpMono, { recursive: true, force: true });
+        fs.rmSync(tmpOutside, { recursive: true, force: true });
+    });
+
+    const siblingRepo = path.join(tmpMono, 'projects', 'sample-service');
+    fs.mkdirSync(siblingRepo, { recursive: true });
+    fs.writeFileSync(
+        path.join(siblingRepo, '.env.example'),
+        'SERVICE_PORT=4190\nAPI_BASE_URL=http://localhost:8080\n'
+    );
+    fs.writeFileSync(
+        path.join(siblingRepo, 'config.js'),
+        "import { envOr, envInt } from '@krusch/toolkit/config';\nexport const port = envInt('SERVICE_PORT', 4190);\nexport const apiUrl = envOr('API_BASE_URL', '');\n"
+    );
+
+    const runtime = await createHydraScopeRuntime({
+        projectRoot: tmpMono,
+        preferOllama: false,
+        hydraUrl: ''
+    });
+
+    const ingestSibling = await runtime.ingestDirectory(siblingRepo);
+    assert.equal(ingestSibling.ok, true);
+    assert.equal(ingestSibling.data.workspaceName, 'sample-service');
+
+    const compiledGraph = runtime.getGraph();
+    const envEdges = compiledGraph.edges.filter((e) => e.type === 'READS_ENV');
+    assert.ok(envEdges.length >= 1, 'Expected READS_ENV edge from envOr/envInt calls to .env.example');
+
+    const outsideAttempt = await runtime.ingestDirectory(tmpOutside);
+    assert.equal(outsideAttempt.ok, false);
+    assert.equal(outsideAttempt.error.code, 'PATH_OUTSIDE_WORKSPACE');
+
+    const resetAttempt = await runtime.ingestDirectory('reset');
+    assert.equal(resetAttempt.ok, true);
+    assert.equal(resetAttempt.data.workspaceName, 'fintech-core');
+});
