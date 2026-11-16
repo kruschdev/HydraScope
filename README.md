@@ -87,11 +87,10 @@ npm test
 npm start
 ```
 
-Open `http://127.0.0.1:4190` to launch the 4-tab **HydraScope Cockpit**:
-1. **`01 Vector vs. HydraDB Arena`**: Side-by-side `1024d` Vector Store vs. HydraDB OpenCypher SVG subgraph visualizer, `asOf` time-travel toggle (`HEAD` vs. `2026-03-01`), and live Cypher + `sgk:1:...` bookmark inspector.
-2. **`02 64-Tool Continual Learning & Load`**: 4-epoch rising accuracy curve (`85.7% -> 100%` F1, `5.0 -> 1.0` round-trips, `-94.2%` tokens) and live concurrent `hydradb:0.4.0` load runner.
-3. **`03 Proof-Over-Vectors Benchmark (8 Tasks)`**: Full 8-scenario evaluation across blast-radius, temporal supersession, cross-artifact trace, and ungrounded subsystem traps.
-4. **`04 Live Graph Studio & Time-Travel ADRs`**: Supersede active ADRs live in HydraDB or compile any local repository directory into the graph.
+Open `http://127.0.0.1:4190` to launch the 3-tab **HydraScope** UI:
+1. **`Compare`**: Prompt-first search with 4 plain-English example presets, a 3-stat verdict bar, side-by-side Vector Search vs. HydraDB Graph results, a 3-step dependency path diagram, `asOf` time-travel (`Today` vs. `2026-03-01`), and a collapsible OpenCypher + prompt inspector.
+2. **`Benchmarks`**: Unified 8-task codebase retrieval scorecard, 64-tool continual learning curve (`85.7% -> 100%` F1, `5.0 -> 1.0` round-trips, `-94.2%` tokens), and live 64-query `hydradb:0.4.0` throughput runner.
+3. **`Studio`**: Retire and replace active ADRs live in HydraDB (`:SUPERSEDES`), replay historical dates, or compile a local repository folder into the graph.
 
 ### Run Self-Hosted HydraDB `v0.4.0` via Docker Compose
 
