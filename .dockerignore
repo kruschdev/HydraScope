@@ -1,5 +1,8 @@
 node_modules
 client/node_modules
+client/dist
+.wrangler
+.agent
 .env
 .env.*
 !.env.example

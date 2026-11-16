@@ -6,6 +6,14 @@
  */
 
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
+import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveText } from '../utils/scrubber.js';
+import {
+    isValidIsoDate,
+    validateOptionalAsOf,
+    validateSupersedePayload,
+    MAX_CUSTOM_DECISIONS,
+    MAX_QUERY_CHARS
+} from '../utils/validation.js';
 
 const STOP_AND_FRAMING_WORDS = new Set([
     'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'being', 'before', 'after',
@@ -97,11 +105,7 @@ export function estimateStructuralTokens(text) {
  * @returns {string}
  */
 function scrubSafeText(raw) {
-    return String(raw ?? '')
-        .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-        .replace(/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}|127\.\d{1,3}\.\d{1,3}\.\d{1,3})(?::\d+)?\b/g, '[REDACTED_HOST]')
-        .replace(/\/home\/[A-Za-z0-9._-]+(?:\/[^\s'")\]]*)?/g, '<WORKSPACE_PATH>')
-        .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[REDACTED_EMAIL]');
+    return scrubSensitiveText(raw);
 }
 
 /**
@@ -263,8 +267,15 @@ function buildOntologyIndex(graph) {
     }
 
     const ont = graph?.ontology || {};
-    if (ont.terms && typeof ont.terms === 'object') {
+    if (Array.isArray(ont.terms)) {
+        for (const term of ont.terms) {
+            if (typeof term === 'string' && !FORBIDDEN_OBJECT_KEYS.has(term)) {
+                addTerm(term, null);
+            }
+        }
+    } else if (ont.terms && typeof ont.terms === 'object') {
         for (const [term, mapped] of Object.entries(ont.terms)) {
+            if (FORBIDDEN_OBJECT_KEYS.has(term)) continue;
             if (Array.isArray(mapped)) {
                 if (mapped.length === 0) addTerm(term, null);
                 for (const id of mapped) addTerm(term, id);
@@ -287,6 +298,7 @@ function buildOntologyIndex(graph) {
 
     if (ont.synonyms && typeof ont.synonyms === 'object') {
         for (const [phrase, target] of Object.entries(ont.synonyms)) {
+            if (FORBIDDEN_OBJECT_KEYS.has(phrase)) continue;
             const cleanPhrase = String(phrase || '').trim().toLowerCase();
             if (!cleanPhrase) continue;
             const targetStr = Array.isArray(target) ? String(target[0] || '') : String(target || '');
@@ -307,7 +319,7 @@ function buildOntologyIndex(graph) {
 export function isNodeActiveAt(node, asOf = null) {
     if (!node || typeof node !== 'object') return false;
     const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
-    if (!cleanAsOf) {
+    if (!cleanAsOf || !isValidIsoDate(cleanAsOf)) {
         return node.isCurrent !== false && !node.retiredAt;
     }
     return (!node.validFrom || node.validFrom <= cleanAsOf) && (!node.retiredAt || node.retiredAt > cleanAsOf);
@@ -722,8 +734,9 @@ function formatCompactNodeExcerpt(node, maxTokens) {
 function buildDisplayCypherQuery(seedIds, maxHops, asOf) {
     const seedList = JSON.stringify(seedIds);
     const hopBound = Math.max(1, Math.min(6, Number(maxHops) || 3));
-    const temporalClause = asOf
-        ? `WHERE (n.valid_from IS NULL OR n.valid_from <= '${asOf}') AND (n.retired_at IS NULL OR n.retired_at > '${asOf}')`
+    const safeAsOf = asOf && isValidIsoDate(asOf) ? asOf.trim() : null;
+    const temporalClause = safeAsOf
+        ? `WHERE (n.valid_from IS NULL OR n.valid_from <= '${safeAsOf}') AND (n.retired_at IS NULL OR n.retired_at > '${safeAsOf}')`
         : `WHERE n.is_current <> false AND n.retired_at IS NULL`;
 
     return [
@@ -757,8 +770,13 @@ export async function traverseStructuralContext(
         );
     }
 
-    const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
-    const effectiveBudget = Math.max(120, Number(tokenBudget) || 900);
+    const asOfCheck = validateOptionalAsOf(asOf);
+    if (!asOfCheck.ok) {
+        return errorEnvelope(asOfCheck.code, asOfCheck.message, null, 'hydrascope.traverse');
+    }
+    const cleanAsOf = asOfCheck.value;
+    const boundedQuery = String(query ?? '').slice(0, MAX_QUERY_CHARS);
+    const effectiveBudget = Math.max(120, Math.min(16000, Number(tokenBudget) || 900));
     const effectiveMaxHops = Math.max(1, Math.min(6, Number(maxHops) || 3));
     const fullRepoTokens =
         Number(graph.totalRepoTokens) > 0
@@ -766,7 +784,7 @@ export async function traverseStructuralContext(
             : graph.nodes.reduce((sum, n) => sum + (Number(n?.tokens) || estimateStructuralTokens(n?.content || '')), 0);
 
     // Step 1: Pre-flight ontology answerability gate
-    const answerCheck = checkAnswerable(graph, query);
+    const answerCheck = checkAnswerable(graph, boundedQuery);
     const answerability = answerCheck.data;
     if (!answerability.answerable) {
         return okEnvelope(
@@ -800,7 +818,7 @@ export async function traverseStructuralContext(
     // Step 2: Structural seed selection
     const idx = buildOntologyIndex(graph);
     const edges = (Array.isArray(graph.edges) ? graph.edges : []).map(normalizeEdge).filter(Boolean);
-    const rawSeeds = selectSeedNodes(graph, query, idx);
+    const rawSeeds = selectSeedNodes(graph, boundedQuery, idx);
 
     const retiredBlockedMap = new Map();
     const traversedEdgeMap = new Map();
@@ -846,6 +864,7 @@ export async function traverseStructuralContext(
         latencyMs: 0,
     };
 
+    let liveDiscoveredLogicalIds = [];
     const seedIds = seedNodes.map((s) => s.id);
     if (seedIds.length > 0 && hydraClient && typeof hydraClient.isConfigured === 'function' && hydraClient.isConfigured()) {
         try {
@@ -856,6 +875,9 @@ export async function traverseStructuralContext(
                 asOf: cleanAsOf,
             });
             const payload = rawHydra?.data && typeof rawHydra.data === 'object' ? rawHydra.data : rawHydra;
+            if (Array.isArray(payload?.discoveredLogicalIds)) {
+                liveDiscoveredLogicalIds = payload.discoveredLogicalIds;
+            }
             hydraExecution = {
                 liveQueried: Boolean(rawHydra?.ok !== false && (payload?.liveQueried ?? true)),
                 mode: payload?.mode || (rawHydra?.ok === false ? 'fallback-mirror' : 'hydradb-v0.4.0'),
@@ -963,6 +985,38 @@ export async function traverseStructuralContext(
                     priority: edgePriority,
                 });
                 bfsQueue.push({ id: candidate.id, hop: hop + 1 });
+            }
+        }
+    }
+
+    // Fold live HydraDB v0.4.0 OpenCypher-discovered nodes directly into reachedMap / retiredBlockedMap
+    if (hydraExecution.liveQueried && liveDiscoveredLogicalIds.length > 0) {
+        for (const rawLid of liveDiscoveredLogicalIds) {
+            const lid = String(rawLid || '').trim();
+            if (!lid) continue;
+            const liveNode = idx.nodeById.get(lid);
+            if (!liveNode) continue;
+            if (!isNodeActiveAt(liveNode, cleanAsOf)) {
+                const lineage = resolveSupersedesComponent(liveNode.id, idx.nodeById, edges, cleanAsOf);
+                for (const r of lineage.retiredMembers) retiredBlockedMap.set(r.id, r);
+                for (const se of lineage.usedSupersedesEdges) recordEdge(se);
+                for (const activeRep of lineage.activeMembers) {
+                    if (!reachedMap.has(activeRep.id)) {
+                        reachedMap.set(activeRep.id, {
+                            node: activeRep,
+                            hop: 2,
+                            role: 'hydradb_opencypher_replacement',
+                            priority: 2,
+                        });
+                    }
+                }
+            } else if (!reachedMap.has(liveNode.id)) {
+                reachedMap.set(liveNode.id, {
+                    node: liveNode,
+                    hop: 2,
+                    role: 'hydradb_opencypher_hop',
+                    priority: 3,
+                });
             }
         }
     }
@@ -1160,17 +1214,33 @@ export async function supersedeDecisionInGraph(
         return errorEnvelope('INVALID_GRAPH', 'Valid graph object is required.', null, 'hydrascope.supersede');
     }
 
-    const cleanOldId = String(oldId || '').trim();
-    const cleanNewId = String(newId || '').trim();
-    const cleanTitle = String(title || '').trim();
-    const cleanContent = String(content || '').trim();
-    const cleanEffectiveAt = String(effectiveAt || new Date().toISOString().slice(0, 10)).trim();
+    const validation = validateSupersedePayload({
+        oldId,
+        newId,
+        title,
+        content,
+        governsIds,
+        effectiveAt,
+    });
+    if (!validation.ok) {
+        return errorEnvelope(validation.code, validation.message, null, 'hydrascope.supersede');
+    }
 
-    if (!cleanOldId || !cleanNewId || !cleanTitle || !cleanContent) {
+    const {
+        oldId: cleanOldId,
+        newId: cleanNewId,
+        title: cleanTitle,
+        content: cleanContent,
+        governsIds: sanitizedGovernsIds,
+        effectiveAt: cleanEffectiveAt,
+    } = validation.value;
+
+    const dynamicCount = graph.nodes.filter((n) => n?._dynamicSupersede === true).length;
+    if (dynamicCount >= MAX_CUSTOM_DECISIONS) {
         return errorEnvelope(
-            'VALIDATION_ERROR',
-            'oldId, newId, title, and content are required to supersede a decision.',
-            { oldId: cleanOldId, newId: cleanNewId },
+            'DECISION_LIMIT_REACHED',
+            `Workspace has reached the maximum of ${MAX_CUSTOM_DECISIONS} dynamic supersessions. Reset workspace to add more.`,
+            { limit: MAX_CUSTOM_DECISIONS },
             'hydrascope.supersede'
         );
     }
@@ -1188,10 +1258,27 @@ export async function supersedeDecisionInGraph(
         );
     }
 
+    if (oldNode.isCurrent === false) {
+        return errorEnvelope(
+            'DECISION_ALREADY_RETIRED',
+            `Decision node "${oldNode.id}" is already retired${oldNode.supersededBy ? ` by ${oldNode.supersededBy}` : ''}. Supersede the currently active replacement instead.`,
+            { oldId: oldNode.id, supersededBy: oldNode.supersededBy || null },
+            'hydrascope.supersede'
+        );
+    }
+
     const hasPrefix = oldNode.id.includes(':') && !cleanNewId.includes(':');
     const resolvedNewId = hasPrefix ? `${oldNode.id.split(':')[0]}:${cleanNewId}` : cleanNewId;
+    const resolvedNewBare = bareLogicalId(resolvedNewId).toLowerCase();
 
-    if (resolvedNewId === oldNode.id || graph.nodes.some((n) => n.id === resolvedNewId)) {
+    if (
+        resolvedNewId === oldNode.id ||
+        graph.nodes.some(
+            (n) =>
+                n.id === resolvedNewId ||
+                bareLogicalId(n.id).toLowerCase() === resolvedNewBare
+        )
+    ) {
         return errorEnvelope(
             'DUPLICATE_DECISION_ID',
             `Decision node "${resolvedNewId}" already exists in workspace graph.`,
@@ -1213,14 +1300,13 @@ export async function supersedeDecisionInGraph(
         .filter((e) => e && e.type === 'GOVERNS' && e.from === oldNode.id)
         .map((e) => e.to);
 
-    const requestedTargets = Array.isArray(governsIds) && governsIds.length > 0
-        ? governsIds
+    const requestedTargets = sanitizedGovernsIds.length > 0
+        ? sanitizedGovernsIds
             .map((gid) => {
-                const clean = String(gid || '').trim();
                 const match =
-                    graph.nodes.find((n) => n.id === clean) ||
-                    graph.nodes.find((n) => bareLogicalId(n.id).toLowerCase() === bareLogicalId(clean).toLowerCase());
-                return match ? match.id : clean;
+                    graph.nodes.find((n) => n.id === gid) ||
+                    graph.nodes.find((n) => bareLogicalId(n.id).toLowerCase() === bareLogicalId(gid).toLowerCase());
+                return match ? match.id : gid;
             })
             .filter(Boolean)
         : inheritedTargets;
@@ -1241,6 +1327,7 @@ export async function supersedeDecisionInGraph(
         retiredAt: null,
         isCurrent: true,
         supersededBy: null,
+        _dynamicSupersede: true,
     };
 
     graph.nodes.push(newNode);
@@ -1265,12 +1352,20 @@ export async function supersedeDecisionInGraph(
     }
     graph.edges.push(...newEdges);
 
-    // Update graph ontology in-place
+    // Update graph ontology safely using null-prototype map (`SEC-01` prototype & Array.length protection)
     if (!graph.ontology || typeof graph.ontology !== 'object') {
-        graph.ontology = { terms: {}, knownConcepts: [], synonyms: {} };
+        graph.ontology = { terms: Object.create(null), knownConcepts: [], synonyms: Object.create(null) };
     }
-    if (!graph.ontology.terms || typeof graph.ontology.terms !== 'object') {
-        graph.ontology.terms = {};
+    if (!graph.ontology.terms || typeof graph.ontology.terms !== 'object' || Array.isArray(graph.ontology.terms)) {
+        const migrated = Object.create(null);
+        if (Array.isArray(graph.ontology.terms)) {
+            for (const existing of graph.ontology.terms) {
+                if (typeof existing === 'string' && !FORBIDDEN_OBJECT_KEYS.has(existing)) {
+                    migrated[existing] = [];
+                }
+            }
+        }
+        graph.ontology.terms = migrated;
     }
     if (!Array.isArray(graph.ontology.knownConcepts)) {
         graph.ontology.knownConcepts = [];
@@ -1284,7 +1379,8 @@ export async function supersedeDecisionInGraph(
         ),
     ]);
     for (const tok of newConceptTokens) {
-        if (!Array.isArray(graph.ontology.terms[tok])) {
+        if (!tok || FORBIDDEN_OBJECT_KEYS.has(tok)) continue;
+        if (!Object.hasOwn(graph.ontology.terms, tok) || !Array.isArray(graph.ontology.terms[tok])) {
             graph.ontology.terms[tok] = [];
         }
         if (!graph.ontology.terms[tok].includes(newNode.id)) {

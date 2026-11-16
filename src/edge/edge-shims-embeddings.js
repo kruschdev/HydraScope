@@ -29,11 +29,12 @@ export function cosineSimilarity(a, b) {
 }
 
 export function generateDeterministicVector(seedText, dims = 256) {
-    const out = new Array(dims).fill(0);
+    const safeDims = Number.isInteger(dims) && dims > 0 ? dims : 256;
+    const out = Array.from({ length: safeDims }, () => 0);
     const str = String(seedText || '');
     for (let i = 0; i < str.length; i += 1) {
-        const idx = (str.charCodeAt(i) * 31 + i * 17) % dims;
-        out[idx] += (i % 2 === 0 ? 1 : -1);
+        const idx = (str.charCodeAt(i) * 31 + i * 17) % safeDims;
+        out[idx] += i % 2 === 0 ? 1 : -1;
     }
     return l2Normalize(out);
 }

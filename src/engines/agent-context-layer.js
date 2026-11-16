@@ -698,7 +698,7 @@ export async function runAgentContextContinualEval({
                 path: s.id,
                 isCurrent: true
             })),
-            ...tools.slice(0, 24).map((t) => ({
+            ...tools.map((t) => ({
                 id: t.id,
                 kind: 'mcp_tool',
                 title: t.name,
@@ -726,6 +726,16 @@ export async function runAgentContextContinualEval({
             cypherOpsCount += seedNodes.length + seedEdges.length;
             lastBookmark = syncRes.data.lastBookmark || null;
             lastReadEpoch = syncRes.data.lastReadEpoch ?? null;
+
+            // Reset learned entity shortcuts before Epoch 1 so every continual run starts cold in HydraDB
+            if (typeof hydraClient.queryCypher === 'function') {
+                const uniqueEntityIds = [...new Set(continualTasks.map((t) => t.canonicalEntity.id))];
+                for (const entityLogicalId of uniqueEntityIds) {
+                    const eid = surrogateVertexId(ns, entityLogicalId);
+                    await hydraClient.queryCypher('MATCH (e:GraphNode {id: $eid}) DETACH DELETE e', { eid });
+                    cypherOpsCount += 1;
+                }
+            }
         }
     }
 
@@ -821,10 +831,11 @@ export async function runAgentContextContinualEval({
         for (const task of continualTasks) {
             const skill = skills.find((s) => s.id === task.skillId);
             const aliasKey = task.entityMention.toLowerCase();
-            const entityAlreadyResolved = resolvedEntities.has(aliasKey);
+            let entityAlreadyResolved = resolvedEntities.has(aliasKey);
             const chainCompressed = compressedSkills.has(skill.id);
+            let liveDiscoveredTools = null;
 
-            // Live OpenCypher read in HydraDB v0.4.0 when connected!
+            // Live OpenCypher read in HydraDB v0.4.0 when connected: drives tool selection & entity resolution!
             if (hydraLive && typeof hydraClient.queryCypher === 'function') {
                 const skillVid = surrogateVertexId(ns, skill.id);
                 const qRes = await hydraClient.queryCypher(
@@ -835,13 +846,33 @@ export async function runAgentContextContinualEval({
                 if (qRes.ok) {
                     lastBookmark = qRes.data.bookmark || lastBookmark;
                     lastReadEpoch = qRes.data.readEpoch ?? lastReadEpoch;
+                    const recs = Array.isArray(qRes.data.records) ? qRes.data.records : [];
+                    if (recs.length > 0) {
+                        const activeFromHydra = [
+                            ...new Set(
+                                recs
+                                    .filter(
+                                        (r) =>
+                                            typeof r.lid === 'string' &&
+                                            r.lid.startsWith('tool:') &&
+                                            r.cur !== false
+                                    )
+                                    .map((r) => r.lid)
+                            )
+                        ];
+                        if (activeFromHydra.length > 0) {
+                            liveDiscoveredTools = activeFromHydra;
+                        }
+                        entityAlreadyResolved = recs.some(
+                            (r) => r.lid === task.canonicalEntity.id && r.cur !== false
+                        );
+                    }
                 }
             }
 
-            // Assemble structural tool set: active entry tool + mandatory post-check tools (never retired v1 tools!)
-            // If entity is NOT yet resolved in HydraDB, agent must also load & invoke the lookup tool (extra round-trip + schema tokens).
-            const activeToolIds = [...task.requiredTools];
-            if (!entityAlreadyResolved) {
+            // Assemble structural tool set from live HydraDB OpenCypher traversal (or offline mirror fallback)
+            const activeToolIds = liveDiscoveredTools ? [...liveDiscoveredTools] : [...task.requiredTools];
+            if (!entityAlreadyResolved && !activeToolIds.includes(task.lookupTool)) {
                 activeToolIds.push(task.lookupTool);
             }
 
@@ -1092,8 +1123,8 @@ export async function runHydraLoadBenchmark({
             if (isWrite) {
                 const probeId = 900000 + idx;
                 res = await hydraClient.queryCypher(
-                    'MERGE (root:WorkspaceRoot {id: 1000})-[:PROBES]->(e:LoadProbe {id: $id, idx: $idx, active: true})',
-                    { id: probeId, idx }
+                    'MERGE (root:WorkspaceRoot {id: 1000, namespace: $ns})-[:PROBES]->(e:LoadProbe {id: $id, idx: $idx, active: true})',
+                    { ns, id: probeId, idx }
                 );
             } else {
                 const sid = seedIds[idx % seedIds.length];
@@ -1115,6 +1146,9 @@ export async function runHydraLoadBenchmark({
 
     await Promise.all(Array.from({ length: boundedConcurrency }, () => worker()));
     const wallMs = Number((performance.now() - wallStart).toFixed(2));
+    if (typeof hydraClient.queryCypher === 'function') {
+        await hydraClient.queryCypher('MATCH (p:LoadProbe) DETACH DELETE p').catch(() => {});
+    }
     latencies.sort((a, b) => a - b);
 
     const pct = (p) => {

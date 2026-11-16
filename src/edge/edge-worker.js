@@ -1,11 +1,11 @@
 import {
     createEdgeRouter,
-    edgeOkEnvelope,
-    edgeErrorEnvelope
+    edgeOkEnvelope
 } from '@krusch/toolkit/edge';
 import { BENCHMARK_SCENARIOS } from '../corpus/fintech-fixture.js';
 import {
     checkAnswerable,
+    isNodeActiveAt,
     traverseStructuralContext,
     supersedeDecisionInGraph
 } from '../engines/structural-retriever.js';
@@ -15,22 +15,75 @@ import {
     runBenchmarkSuite
 } from '../engines/vector-benchmark.js';
 import { runAgentContextContinualEval } from '../engines/agent-context-layer.js';
+import { scrubSensitiveStrings } from '../utils/scrubber.js';
+import {
+    validateOptionalAsOf,
+    buildDynamicScenariosForGraph,
+    MAX_QUERY_CHARS
+} from '../utils/validation.js';
 import EDGE_SNAPSHOT from './generated-edge-snapshot.json';
 
 function cloneJson(val) {
     return JSON.parse(JSON.stringify(val));
 }
 
+function createIsolateRateLimiter({ windowMs = 60_000, max = 120, maxKeys = 2048 } = {}) {
+    const buckets = new Map();
+    return function checkRequest(request) {
+        const now = Date.now();
+        const rawIp =
+            request?.headers?.get?.('cf-connecting-ip') ||
+            request?.headers?.get?.('x-real-ip') ||
+            'edge-anon';
+        const key = String(rawIp).trim().slice(0, 64) || 'edge-anon';
+        let entry = buckets.get(key);
+        if (!entry || entry.resetAt <= now) {
+            if (buckets.size >= maxKeys) {
+                for (const [k, v] of buckets.entries()) {
+                    if (v.resetAt <= now) buckets.delete(k);
+                }
+                if (buckets.size >= maxKeys) {
+                    const oldest = buckets.keys().next().value;
+                    if (oldest !== undefined) buckets.delete(oldest);
+                }
+            }
+            entry = { count: 0, resetAt: now + windowMs };
+            buckets.set(key, entry);
+        }
+        if (entry.count + 1 > max) {
+            const retryAfter = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+            return { allowed: false, retryAfter };
+        }
+        entry.count += 1;
+        return { allowed: true, retryAfter: 0 };
+    };
+}
+
+const checkReadLimit = createIsolateRateLimiter({ windowMs: 60_000, max: 120 });
+const checkMutationLimit = createIsolateRateLimiter({ windowMs: 60_000, max: 20 });
+
 let activeGraph = cloneJson(EDGE_SNAPSHOT.fintechGraph);
+let activeScenarios = BENCHMARK_SCENARIOS.slice();
 let activeVectorIndex = null;
+let graphRevision = 0;
 let epochCounter = Number(EDGE_SNAPSHOT.initialEpoch || 789);
+let mutationChain = Promise.resolve();
+
+function withMutationLock(fn) {
+    const next = mutationChain.then(fn, fn);
+    mutationChain = next.then(
+        () => undefined,
+        () => undefined
+    );
+    return next;
+}
 
 async function ensureVectorIndex() {
     if (!activeVectorIndex) {
         activeVectorIndex = await buildVectorIndex(activeGraph, { preferOllama: false });
-        // Restore pre-computed 1024d snowflake-arctic-embed2 vectors on matching fintech-core nodes when unchanged!
         if (
             activeGraph.workspaceName === 'fintech-core' &&
+            graphRevision === 0 &&
             Array.isArray(EDGE_SNAPSHOT.fintechVectors1024) &&
             EDGE_SNAPSHOT.fintechVectors1024.length === activeGraph.nodes.length
         ) {
@@ -111,7 +164,7 @@ function createEdgeHydraMirrorClient() {
 
 const hydraClient = createEdgeHydraMirrorClient();
 
-const router = createEdgeRouter({
+export const router = createEdgeRouter({
     serviceName: 'hydrascope',
     version: '0.1.0',
     assetsBinding: 'ASSETS',
@@ -123,9 +176,11 @@ const router = createEdgeRouter({
     }),
     routes: {
         'GET /api/state': async () => {
+            const graphSnap = activeGraph;
+            const scenariosSnap = activeScenarios;
             const vIdx = await ensureVectorIndex();
             const health = await hydraClient.healthz();
-            const decisions = activeGraph.nodes
+            const decisions = graphSnap.nodes
                 .filter((n) => n.kind === 'decision' || n.kind === 'adr' || n.kind === 'invariant')
                 .map((n) => ({
                     id: n.id,
@@ -137,57 +192,90 @@ const router = createEdgeRouter({
                     isCurrent: n.isCurrent,
                     supersededBy: n.supersededBy
                 }));
+
+            const payload = scrubSensitiveStrings({
+                workspaceName: graphSnap.workspaceName,
+                totalRepoTokens: graphSnap.totalRepoTokens,
+                nodeCount: graphSnap.nodes.length,
+                edgeCount: graphSnap.edges.length,
+                embeddingBackend: vIdx.embeddingBackend,
+                hydraHealth: health.data,
+                scenarios: scenariosSnap.map((s) => ({
+                    id: s.id,
+                    category: s.category,
+                    title: s.title,
+                    query: s.query,
+                    asOf: s.asOf || null,
+                    tokenBudget: s.tokenBudget,
+                    explanation: s.explanation
+                })),
+                decisions,
+                nodes: graphSnap.nodes.map((n) => ({
+                    id: n.id,
+                    kind: n.kind,
+                    title: n.title,
+                    path: n.path,
+                    tokens: n.tokens,
+                    isCurrent: n.isCurrent,
+                    retiredAt: n.retiredAt,
+                    supersededBy: n.supersededBy
+                })),
+                edges: graphSnap.edges
+            });
+
             return edgeOkEnvelope(
                 'hydrascope.state',
-                `Loaded ${activeGraph.workspaceName} (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} edges).`,
-                {
-                    workspaceName: activeGraph.workspaceName,
-                    totalRepoTokens: activeGraph.totalRepoTokens,
-                    nodeCount: activeGraph.nodes.length,
-                    edgeCount: activeGraph.edges.length,
-                    embeddingBackend: vIdx.embeddingBackend,
-                    hydraHealth: health.data,
-                    scenarios: BENCHMARK_SCENARIOS.map((s) => ({
-                        id: s.id,
-                        category: s.category,
-                        title: s.title,
-                        query: s.query,
-                        asOf: s.asOf || null,
-                        tokenBudget: s.tokenBudget,
-                        explanation: s.explanation
-                    })),
-                    decisions,
-                    nodes: activeGraph.nodes.map((n) => ({
-                        id: n.id,
-                        kind: n.kind,
-                        title: n.title,
-                        path: n.path,
-                        tokens: n.tokens,
-                        isCurrent: n.isCurrent,
-                        retiredAt: n.retiredAt,
-                        supersededBy: n.supersededBy
-                    })),
-                    edges: activeGraph.edges
-                }
+                `Loaded ${graphSnap.workspaceName} (${graphSnap.nodes.length} nodes, ${graphSnap.edges.length} edges).`,
+                payload
             );
         },
 
-        'POST /api/arena/compare': async ({ body }) => {
+        'POST /api/arena/compare': async ({ request, body, fail, json }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.compare',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+
             const prompt = String(body?.query || '').trim();
             if (!prompt) {
-                return new Response(
-                    JSON.stringify(edgeErrorEnvelope('QUERY_REQUIRED', 'Field "query" is required.', null, 'hydrascope.compare')),
-                    { status: 400, headers: { 'Content-Type': 'application/json' } }
-                );
+                return fail('QUERY_REQUIRED', 'Field "query" is required.', {
+                    status: 400,
+                    tool: 'hydrascope.compare'
+                });
             }
-            const asOf = body?.asOf ? String(body.asOf).trim() : null;
-            const tokenBudget = Number(body?.tokenBudget) || 900;
-            const topK = Number(body?.topK) || 4;
+            if (prompt.length > MAX_QUERY_CHARS) {
+                return fail('QUERY_TOO_LONG', `Field "query" exceeds ${MAX_QUERY_CHARS} characters.`, {
+                    status: 400,
+                    tool: 'hydrascope.compare'
+                });
+            }
 
-            // If pre-captured exact 1024d query vector exists for this prompt on unmodified fintech-core, use it!
-            const preQueryVec = EDGE_SNAPSHOT.queryVectors1024?.[prompt];
+            const asOfCheck = validateOptionalAsOf(body?.asOf);
+            if (!asOfCheck.ok) {
+                return fail(asOfCheck.code, asOfCheck.message, {
+                    status: 400,
+                    tool: 'hydrascope.compare'
+                });
+            }
+            const asOf = asOfCheck.value;
+            const tokenBudget = Math.min(16000, Math.max(120, Number(body?.tokenBudget) || 900));
+            const topK = Math.min(20, Math.max(1, Number(body?.topK) || 4));
+
+            const graphSnap = activeGraph;
+            const queryVecMap = EDGE_SNAPSHOT.queryVectors1024 || {};
+            const preQueryVec = Object.hasOwn(queryVecMap, prompt) ? queryVecMap[prompt] : null;
             const vIdx = await ensureVectorIndex();
-            if (preQueryVec && vIdx.embeddingBackend === 'ollama-snowflake-arctic-embed2-1024d') {
+
+            if (
+                preQueryVec &&
+                graphRevision === 0 &&
+                graphSnap.workspaceName === 'fintech-core' &&
+                vIdx.embeddingBackend === 'ollama-snowflake-arctic-embed2-1024d'
+            ) {
                 const { cosineSimilarity } = await import('./edge-shims-embeddings.js');
                 const scored = vIdx.chunks
                     .map((chunk) => ({ chunk, score: cosineSimilarity(preQueryVec, chunk.vector) }))
@@ -215,49 +303,63 @@ const router = createEdgeRouter({
                     .map(({ chunk, score }, idx) => `--- [Rank #${idx + 1} | ${chunk.id} | cosine=${score.toFixed(3)}] ---\n${chunk.content}`)
                     .join('\n\n');
                 const vectorTokens = Math.ceil(new TextEncoder().encode(contextText).byteLength / 4);
-                const hydraEnv = await traverseStructuralContext(activeGraph, {
+                const hydraEnv = await traverseStructuralContext(graphSnap, {
                     query: prompt,
                     asOf,
                     tokenBudget,
                     hydraClient
                 });
+                if (!hydraEnv.ok) {
+                    return json(scrubSensitiveStrings(hydraEnv), { status: 400 });
+                }
                 const hydraData = hydraEnv.data;
                 const vectorPoisonedNodes = selected
                     .map((s) => s.chunk)
-                    .filter((c) => !asOf ? (!c.isCurrent || Boolean(c.retiredAt)) : (Boolean(c.retiredAt) && c.retiredAt <= asOf))
-                    .map((c) => ({ id: c.id, kind: c.kind, title: c.title, retiredAt: c.retiredAt, supersededBy: c.supersededBy }));
+                    .filter((c) => !isNodeActiveAt(c, asOf))
+                    .map((c) => ({
+                        id: c.id,
+                        kind: c.kind,
+                        title: c.title,
+                        retiredAt: c.retiredAt,
+                        supersededBy: c.supersededBy
+                    }));
                 const structuralOnlyNodes = hydraData.traversedNodes.filter((n) => !selectedIds.has(n.id));
-                const fullRepoTokens = activeGraph.totalRepoTokens;
+                const fullRepoTokens = graphSnap.totalRepoTokens;
                 const hydraTokens = hydraData.tokenCount;
-                return edgeOkEnvelope('hydrascope.compare', 'Completed 1024d Vector vs HydraDB comparison', {
-                    query: prompt,
-                    asOf,
-                    vector: {
-                        rankedChunks,
-                        selectedNodeIds: [...selectedIds],
-                        contextText,
-                        tokenCount: vectorTokens,
-                        embeddingBackend: 'ollama-snowflake-arctic-embed2-1024d',
-                        latencyMs: 14.2
-                    },
-                    hydra: hydraData,
-                    hydraScope: hydraData,
-                    vectorPoisonedNodes,
-                    structuralOnlyNodes,
-                    tokenDelta: {
-                        fullRepoTokens,
-                        vectorTokens,
-                        hydraTokens,
-                        savingsVsRepoPct: Number((((fullRepoTokens - hydraTokens) / fullRepoTokens) * 100).toFixed(1)),
-                        savingsVsVectorPct: vectorTokens > 0 ? Number((((vectorTokens - hydraTokens) / vectorTokens) * 100).toFixed(1)) : 0
-                    }
-                });
+
+                return scrubSensitiveStrings(
+                    edgeOkEnvelope('hydrascope.compare', 'Completed 1024d Vector vs HydraDB comparison', {
+                        query: prompt,
+                        asOf,
+                        vector: {
+                            rankedChunks,
+                            selectedNodeIds: [...selectedIds],
+                            contextText,
+                            tokenCount: vectorTokens,
+                            embeddingBackend: 'ollama-snowflake-arctic-embed2-1024d',
+                            latencyMs: 14.2
+                        },
+                        hydra: hydraData,
+                        hydraScope: hydraData,
+                        vectorPoisonedNodes,
+                        structuralOnlyNodes,
+                        tokenDelta: {
+                            fullRepoTokens,
+                            vectorTokens,
+                            hydraTokens,
+                            savingsVsRepoPct: Number((((fullRepoTokens - hydraTokens) / fullRepoTokens) * 100).toFixed(1)),
+                            savingsVsVectorPct:
+                                vectorTokens > 0
+                                    ? Number((((vectorTokens - hydraTokens) / vectorTokens) * 100).toFixed(1))
+                                    : 0
+                        }
+                    })
+                );
             }
 
-            // Custom interactive user query: run live structural traversal + hashed-ngram cosine index!
-            const lexicalIndex = await buildVectorIndex(activeGraph, { preferOllama: false });
-            return compareQueryHeadToHead({
-                graph: activeGraph,
+            const lexicalIndex = await buildVectorIndex(graphSnap, { preferOllama: false });
+            const cmpRes = await compareQueryHeadToHead({
+                graph: graphSnap,
                 vectorIndex: lexicalIndex,
                 hydraClient,
                 query: prompt,
@@ -265,22 +367,49 @@ const router = createEdgeRouter({
                 tokenBudget,
                 topK
             });
+            if (!cmpRes.ok) {
+                return json(scrubSensitiveStrings(cmpRes), { status: 400 });
+            }
+            return scrubSensitiveStrings(cmpRes);
         },
 
-        'POST /api/benchmark/run': async () => {
-            if (activeGraph.workspaceName === 'fintech-core' && activeGraph.nodes.length === 18 && EDGE_SNAPSHOT.benchmarkResult) {
+        'POST /api/benchmark/run': async ({ request, fail }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.benchmark',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+            const graphSnap = activeGraph;
+            const scenariosSnap = activeScenarios;
+            if (
+                graphSnap.workspaceName === 'fintech-core' &&
+                graphRevision === 0 &&
+                EDGE_SNAPSHOT.benchmarkResult
+            ) {
                 return EDGE_SNAPSHOT.benchmarkResult;
             }
-            const lexicalIndex = await buildVectorIndex(activeGraph, { preferOllama: false });
-            return runBenchmarkSuite({
-                graph: activeGraph,
+            const lexicalIndex = await buildVectorIndex(graphSnap, { preferOllama: false });
+            const res = await runBenchmarkSuite({
+                graph: graphSnap,
                 vectorIndex: lexicalIndex,
                 hydraClient,
-                scenarios: BENCHMARK_SCENARIOS
+                scenarios: scenariosSnap
             });
+            return scrubSensitiveStrings(res);
         },
 
-        'POST /api/continual/run': async () => {
+        'POST /api/continual/run': async ({ request, fail }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.continual_eval',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
             if (EDGE_SNAPSHOT.continualResult) {
                 epochCounter += 8;
                 return {
@@ -292,15 +421,24 @@ const router = createEdgeRouter({
                     }
                 };
             }
-            return runAgentContextContinualEval({ hydraClient, preferOllama: false });
+            return scrubSensitiveStrings(await runAgentContextContinualEval({ hydraClient, preferOllama: false }));
         },
 
-        'POST /api/benchmark/load': async ({ body }) => {
+        'POST /api/benchmark/load': async ({ request, body, fail }) => {
+            const rl = checkMutationLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.load_bench',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
             const totalRequests = Math.min(200, Math.max(8, Number(body?.totalRequests) || 64));
             const concurrency = Math.min(24, Math.max(1, Number(body?.concurrency) || 8));
             const t0 = performance.now();
+            const scenariosSnap = activeScenarios.length > 0 ? activeScenarios : BENCHMARK_SCENARIOS;
             for (let i = 0; i < totalRequests; i += 1) {
-                checkAnswerable(activeGraph, BENCHMARK_SCENARIOS[i % BENCHMARK_SCENARIOS.length].query);
+                checkAnswerable(activeGraph, scenariosSnap[i % scenariosSnap.length].query);
             }
             epochCounter += totalRequests;
             const scale = totalRequests / 64;
@@ -331,67 +469,103 @@ const router = createEdgeRouter({
             );
         },
 
-        'POST /api/decisions/supersede': async ({ body }) => {
+        'POST /api/decisions/supersede': async ({ request, body, fail, json }) => {
+            const rl = checkMutationLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.supersede',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+
             const oldId = String(body?.oldId || '').trim();
             const newId = String(body?.newId || '').trim();
             const title = String(body?.title || '').trim();
             const content = String(body?.content || '').trim();
             if (!oldId || !newId || !title || !content) {
-                return new Response(
-                    JSON.stringify(edgeErrorEnvelope('INVALID_SUPERSEDE_BODY', 'Fields oldId, newId, title, and content are required.')),
-                    { status: 400, headers: { 'Content-Type': 'application/json' } }
-                );
-            }
-            const res = await supersedeDecisionInGraph(activeGraph, {
-                oldId,
-                newId,
-                title,
-                content,
-                governsIds: Array.isArray(body?.governsIds) ? body.governsIds : [],
-                effectiveAt: body?.effectiveAt ? String(body.effectiveAt).trim() : undefined,
-                hydraClient
-            });
-            activeVectorIndex = null;
-            return res;
-        },
-
-        'POST /api/workspace/ingest-dir': async ({ body }) => {
-            const targetDir = String(body?.targetDir || '').trim();
-            if (!targetDir || targetDir === 'reset') {
-                activeGraph = cloneJson(EDGE_SNAPSHOT.fintechGraph);
-                activeVectorIndex = null;
-                return edgeOkEnvelope('hydrascope.ingest_dir', 'Reset workspace to 18-artifact FinTech benchmark graph.', {
-                    workspaceName: activeGraph.workspaceName,
-                    nodeCount: activeGraph.nodes.length,
-                    edgeCount: activeGraph.edges.length,
-                    totalRepoTokens: activeGraph.totalRepoTokens
+                return fail('INVALID_SUPERSEDE_BODY', 'Fields oldId, newId, title, and content are required.', {
+                    status: 400,
+                    tool: 'hydrascope.supersede'
                 });
             }
-            if (targetDir === '.' || targetDir === './src' || targetDir === 'src') {
-                activeGraph = cloneJson(EDGE_SNAPSHOT.selfSrcGraph);
+
+            return withMutationLock(async () => {
+                const res = await supersedeDecisionInGraph(activeGraph, {
+                    oldId,
+                    newId,
+                    title,
+                    content,
+                    governsIds: Array.isArray(body?.governsIds) ? body.governsIds : [],
+                    effectiveAt: body?.effectiveAt ? String(body.effectiveAt).trim() : undefined,
+                    hydraClient
+                });
+                const safeRes = scrubSensitiveStrings(res);
+                if (!res.ok) {
+                    return json(safeRes, { status: 400 });
+                }
+                graphRevision += 1;
                 activeVectorIndex = null;
-                return edgeOkEnvelope(
-                    'hydrascope.ingest_dir',
-                    `Compiled HydraScope ./src (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} structural edges) into graph.`,
-                    {
+                return safeRes;
+            });
+        },
+
+        'POST /api/workspace/ingest-dir': async ({ request, body, fail }) => {
+            const rl = checkMutationLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.ingest_dir',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+
+            if (body === null || body === undefined || typeof body !== 'object' || !Object.hasOwn(body, 'targetDir')) {
+                return fail('TARGET_DIR_REQUIRED', 'Field "targetDir" is required (use "reset" to restore default workspace).', {
+                    status: 400,
+                    tool: 'hydrascope.ingest_dir'
+                });
+            }
+
+            const targetDir = String(body.targetDir ?? '').trim();
+            return withMutationLock(async () => {
+                if (!targetDir || targetDir === 'reset') {
+                    activeGraph = cloneJson(EDGE_SNAPSHOT.fintechGraph);
+                    activeScenarios = BENCHMARK_SCENARIOS.slice();
+                    activeVectorIndex = null;
+                    graphRevision = 0;
+                    return edgeOkEnvelope('hydrascope.ingest_dir', 'Reset workspace to 18-artifact FinTech benchmark graph.', {
                         workspaceName: activeGraph.workspaceName,
                         nodeCount: activeGraph.nodes.length,
                         edgeCount: activeGraph.edges.length,
                         totalRepoTokens: activeGraph.totalRepoTokens
+                    });
+                }
+                if (targetDir === '.' || targetDir === './src' || targetDir === 'src') {
+                    activeGraph = cloneJson(EDGE_SNAPSHOT.selfSrcGraph);
+                    activeScenarios = buildDynamicScenariosForGraph(activeGraph);
+                    activeVectorIndex = null;
+                    graphRevision += 1;
+                    return edgeOkEnvelope(
+                        'hydrascope.ingest_dir',
+                        `Compiled HydraScope ./src (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} structural edges) into graph.`,
+                        {
+                            workspaceName: activeGraph.workspaceName,
+                            nodeCount: activeGraph.nodes.length,
+                            edgeCount: activeGraph.edges.length,
+                            totalRepoTokens: activeGraph.totalRepoTokens
+                        }
+                    );
+                }
+                return fail(
+                    'PUBLIC_DEMO_PRESET_ONLY',
+                    'Public cloud demo supports "./src" or "reset". Clone the repo locally to run `hydrascope ingest <any-local-repo>` against your own filesystem.',
+                    {
+                        status: 400,
+                        tool: 'hydrascope.ingest_dir'
                     }
                 );
-            }
-            return new Response(
-                JSON.stringify(
-                    edgeErrorEnvelope(
-                        'PUBLIC_DEMO_PRESET_ONLY',
-                        'Public cloud demo supports "./src" or "reset". Clone the repo locally to run `hydrascope ingest <any-local-repo>` against your own filesystem.',
-                        null,
-                        'hydrascope.ingest_dir'
-                    )
-                ),
-                { status: 400, headers: { 'Content-Type': 'application/json' } }
-            );
+            });
         }
     }
 });

@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
+import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveText } from '../utils/scrubber.js';
 
 const TOOL_NAME = 'hydrascope.compile_dir';
 const MAX_FILE_BYTES = 131072; // 128 KiB
@@ -56,10 +57,7 @@ const CODE_PROBE_EXTS = [
  * @returns {string}
  */
 function sanitizeMetadataText(raw) {
-    return String(raw ?? '')
-        .replace(/\/home\/[A-Za-z0-9._-]+/g, '<workspace>')
-        .replace(/\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}|100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}|127\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g, '<redacted-ip>')
-        .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '<redacted-email>');
+    return scrubSensitiveText(raw);
 }
 
 /**
@@ -498,23 +496,25 @@ export function compileArtifactsToGraph(artifacts = [], { workspaceName = 'finte
     // Pass 4: Build pre-flight domain ontology (terms, knownConcepts, synonyms).
     const termSet = new Set();
     const conceptSet = new Set();
-    const synonymMap = {};
+    const synonymMap = Object.create(null);
 
     const addIndexedToken = (rawVal) => {
         const clean = String(rawVal ?? '').trim();
         if (!clean) return;
         const lowered = clean.toLowerCase();
-        if (/^[a-z0-9_:-]{2,}$/.test(lowered)) {
+        if (/^[a-z0-9_:-]{2,}$/.test(lowered) && !FORBIDDEN_OBJECT_KEYS.has(lowered)) {
             termSet.add(lowered);
         }
         for (const tok of splitIdentifierTokens(clean)) {
-            termSet.add(tok);
+            if (!FORBIDDEN_OBJECT_KEYS.has(tok)) {
+                termSet.add(tok);
+            }
         }
     };
 
     const addSynonymLink = (phrase, nodeId) => {
         const key = String(phrase ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
-        if (!key) return;
+        if (!key || FORBIDDEN_OBJECT_KEYS.has(key)) return;
         if (!Object.hasOwn(synonymMap, key)) {
             synonymMap[key] = [];
         }
@@ -715,7 +715,10 @@ function parseMarkdownArtifactMeta(content, relPath) {
  * @param {string} [options.workspaceName] - Optional logical workspace label
  * @returns {{ ok: boolean, tool: string, summary: string, data?: object, error?: object }}
  */
-export function compileDirectoryToGraph(targetDir, { maxFiles = 120, workspaceName } = {}) {
+export function compileDirectoryToGraph(
+    targetDir,
+    { maxFiles = 120, workspaceName, rejectSymlinkRoot = false } = {}
+) {
     if (!targetDir || typeof targetDir !== 'string' || !targetDir.trim()) {
         return errorEnvelope(
             'INVALID_TARGET_DIR',
@@ -725,15 +728,38 @@ export function compileDirectoryToGraph(targetDir, { maxFiles = 120, workspaceNa
         );
     }
 
-    const resolvedRoot = path.resolve(targetDir.trim());
+    const candidateRoot = path.resolve(targetDir.trim());
+    let lstat;
+    try {
+        lstat = fs.lstatSync(candidateRoot);
+    } catch {
+        return errorEnvelope(
+            'DIRECTORY_NOT_FOUND',
+            'Target directory does not exist or cannot be accessed.',
+            { directory: path.basename(candidateRoot) || 'unknown' },
+            TOOL_NAME
+        );
+    }
+
+    if (rejectSymlinkRoot && lstat.isSymbolicLink()) {
+        return errorEnvelope(
+            'SYMLINK_ROOT_REJECTED',
+            'Symbolic link directories cannot be compiled via restricted workspace endpoints.',
+            { target: path.basename(candidateRoot) },
+            TOOL_NAME
+        );
+    }
+
+    let resolvedRoot;
     let rootStat;
     try {
+        resolvedRoot = fs.realpathSync(candidateRoot);
         rootStat = fs.statSync(resolvedRoot);
     } catch {
         return errorEnvelope(
             'DIRECTORY_NOT_FOUND',
             'Target directory does not exist or cannot be accessed.',
-            { directory: path.basename(resolvedRoot) || 'unknown' },
+            { directory: path.basename(candidateRoot) || 'unknown' },
             TOOL_NAME
         );
     }

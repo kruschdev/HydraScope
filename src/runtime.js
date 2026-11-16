@@ -1,7 +1,8 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { config } from './config.js';
-import { createHydraOpenCypherClient, scrubSensitiveStrings } from './connectors/hydradb-client.js';
+import { createHydraOpenCypherClient } from './connectors/hydradb-client.js';
 import { FINTECH_BENCHMARK_CORPUS, BENCHMARK_SCENARIOS } from './corpus/fintech-fixture.js';
 import { compileArtifactsToGraph, compileDirectoryToGraph } from './engines/repo-compiler.js';
 import {
@@ -18,9 +19,12 @@ import {
     runAgentContextContinualEval,
     runHydraLoadBenchmark
 } from './engines/agent-context-layer.js';
+import { scrubSensitiveStrings } from './utils/scrubber.js';
+import { buildDynamicScenariosForGraph } from './utils/validation.js';
 
 export async function createHydraScopeRuntime(options = {}) {
     const preferOllama = options.preferOllama !== false;
+    const projectRoot = options.projectRoot || config.projectRoot;
     const hydraClient =
         options.hydraClient ||
         createHydraOpenCypherClient({
@@ -56,7 +60,22 @@ export async function createHydraScopeRuntime(options = {}) {
         model: options.embedModel ?? config.embedModel
     });
 
+    // Serialize graph mutations (`supersedeDecision`, `ingestDirectory`) so concurrent requests never tear state.
+    let mutationChain = Promise.resolve();
+    function withMutationLock(fn) {
+        const next = mutationChain.then(fn, fn);
+        mutationChain = next.then(
+            () => undefined,
+            () => undefined
+        );
+        return next;
+    }
+
     async function getState() {
+        const graphSnap = activeGraph;
+        const scenariosSnap = activeScenarios;
+        const vecSnap = vectorIndex;
+
         const healthRes = await hydraClient.healthz();
         const hydraHealth = healthRes.ok
             ? healthRes.data
@@ -68,7 +87,7 @@ export async function createHydraScopeRuntime(options = {}) {
                   latencyMs: 0
               };
 
-        const decisions = activeGraph.nodes
+        const decisions = graphSnap.nodes
             .filter((n) => n.kind === 'decision' || n.kind === 'adr' || n.kind === 'invariant')
             .map((n) => ({
                 id: n.id,
@@ -81,48 +100,51 @@ export async function createHydraScopeRuntime(options = {}) {
                 supersededBy: n.supersededBy
             }));
 
+        const payload = scrubSensitiveStrings({
+            workspaceName: graphSnap.workspaceName,
+            totalRepoTokens: graphSnap.totalRepoTokens,
+            nodeCount: graphSnap.nodes.length,
+            edgeCount: graphSnap.edges.length,
+            embeddingBackend: vecSnap.embeddingBackend,
+            hydraHealth,
+            lastSync,
+            scenarios: scenariosSnap.map((s) => ({
+                id: s.id,
+                category: s.category,
+                title: s.title,
+                query: s.query,
+                asOf: s.asOf || null,
+                tokenBudget: s.tokenBudget,
+                explanation: s.explanation
+            })),
+            decisions,
+            nodes: graphSnap.nodes.map((n) => ({
+                id: n.id,
+                kind: n.kind,
+                title: n.title,
+                path: n.path,
+                tokens: n.tokens,
+                isCurrent: n.isCurrent,
+                retiredAt: n.retiredAt,
+                supersededBy: n.supersededBy
+            })),
+            edges: graphSnap.edges
+        });
+
         return okEnvelope(
             'hydrascope.state',
-            `Loaded ${activeGraph.workspaceName} (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} edges).`,
-            {
-                workspaceName: activeGraph.workspaceName,
-                totalRepoTokens: activeGraph.totalRepoTokens,
-                nodeCount: activeGraph.nodes.length,
-                edgeCount: activeGraph.edges.length,
-                embeddingBackend: vectorIndex.embeddingBackend,
-                hydraHealth: scrubSensitiveStrings(hydraHealth),
-                lastSync: scrubSensitiveStrings(lastSync),
-                scenarios: activeScenarios.map((s) => ({
-                    id: s.id,
-                    category: s.category,
-                    title: s.title,
-                    query: s.query,
-                    asOf: s.asOf || null,
-                    tokenBudget: s.tokenBudget,
-                    explanation: s.explanation
-                })),
-                decisions,
-                nodes: activeGraph.nodes.map((n) => ({
-                    id: n.id,
-                    kind: n.kind,
-                    title: n.title,
-                    path: n.path,
-                    tokens: n.tokens,
-                    isCurrent: n.isCurrent,
-                    retiredAt: n.retiredAt,
-                    supersededBy: n.supersededBy
-                })),
-                edges: activeGraph.edges
-            }
+            `Loaded ${graphSnap.workspaceName} (${graphSnap.nodes.length} nodes, ${graphSnap.edges.length} edges).`,
+            payload
         );
     }
 
     function checkAnswerable(query) {
-        return runAnswerabilityCheck(activeGraph, query);
+        return scrubSensitiveStrings(runAnswerabilityCheck(activeGraph, query));
     }
 
     async function traverse({ query, asOf = null, tokenBudget = 900, maxHops = 3 } = {}) {
-        const res = await traverseStructuralContext(activeGraph, {
+        const graphSnap = activeGraph;
+        const res = await traverseStructuralContext(graphSnap, {
             query,
             asOf,
             tokenBudget,
@@ -133,9 +155,11 @@ export async function createHydraScopeRuntime(options = {}) {
     }
 
     async function compare({ query, asOf = null, tokenBudget = 900, topK = 4 } = {}) {
+        const graphSnap = activeGraph;
+        const vecSnap = vectorIndex;
         const res = await compareQueryHeadToHead({
-            graph: activeGraph,
-            vectorIndex,
+            graph: graphSnap,
+            vectorIndex: vecSnap,
             hydraClient,
             query,
             asOf,
@@ -146,11 +170,14 @@ export async function createHydraScopeRuntime(options = {}) {
     }
 
     async function runBenchmark() {
+        const graphSnap = activeGraph;
+        const vecSnap = vectorIndex;
+        const scenariosSnap = activeScenarios;
         const res = await runBenchmarkSuite({
-            graph: activeGraph,
-            vectorIndex,
+            graph: graphSnap,
+            vectorIndex: vecSnap,
             hydraClient,
-            scenarios: activeScenarios
+            scenarios: scenariosSnap
         });
         return scrubSensitiveStrings(res);
     }
@@ -174,7 +201,7 @@ export async function createHydraScopeRuntime(options = {}) {
         return scrubSensitiveStrings(res);
     }
 
-    async function supersedeDecision({
+    function supersedeDecision({
         oldId,
         newId,
         title,
@@ -182,92 +209,162 @@ export async function createHydraScopeRuntime(options = {}) {
         governsIds = [],
         effectiveAt
     } = {}) {
-        const res = await supersedeDecisionInGraph(activeGraph, {
-            oldId,
-            newId,
-            title,
-            content,
-            governsIds,
-            effectiveAt,
-            hydraClient
-        });
-        if (!res.ok) return scrubSensitiveStrings(res);
-
-        vectorIndex = await buildVectorIndex(activeGraph, {
-            preferOllama,
-            ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
-            model: options.embedModel ?? config.embedModel
-        });
-        return scrubSensitiveStrings(res);
-    }
-
-    async function ingestDirectory(targetDir, { allowExternalPaths = false } = {}) {
-        const cleanTarget = String(targetDir || '').trim();
-        if (!cleanTarget || cleanTarget === 'reset') {
-            activeGraph = compileArtifactsToGraph(FINTECH_BENCHMARK_CORPUS, {
-                workspaceName: 'fintech-core'
+        return withMutationLock(async () => {
+            const res = await supersedeDecisionInGraph(activeGraph, {
+                oldId,
+                newId,
+                title,
+                content,
+                governsIds,
+                effectiveAt,
+                hydraClient
             });
-            activeScenarios = BENCHMARK_SCENARIOS.slice();
-            if (hydraClient.isConfigured()) {
-                await hydraClient.syncGraphSnapshot({
-                    nodes: activeGraph.nodes,
-                    edges: activeGraph.edges
-                });
-            }
+            if (!res.ok) return scrubSensitiveStrings(res);
+
             vectorIndex = await buildVectorIndex(activeGraph, {
                 preferOllama,
                 ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
                 model: options.embedModel ?? config.embedModel
             });
-            return okEnvelope('hydrascope.ingest_dir', 'Reset workspace to 18-artifact FinTech benchmark graph.', {
-                workspaceName: activeGraph.workspaceName,
-                nodeCount: activeGraph.nodes.length,
-                edgeCount: activeGraph.edges.length,
-                totalRepoTokens: activeGraph.totalRepoTokens
-            });
-        }
-
-        const resolved = path.resolve(config.projectRoot, cleanTarget);
-        if (
-            !allowExternalPaths &&
-            resolved !== config.projectRoot &&
-            !resolved.startsWith(config.projectRoot + path.sep)
-        ) {
-            return errorEnvelope(
-                'PATH_OUTSIDE_WORKSPACE',
-                'HTTP directory compilation is restricted to paths within the project workspace (e.g. "." or "./src"). Use the local CLI (`hydrascope ingest <dir>`) for external paths.',
-                null,
-                'hydrascope.ingest_dir'
-            );
-        }
-        const compiled = compileDirectoryToGraph(resolved);
-        if (!compiled.ok) {
-            return scrubSensitiveStrings(compiled);
-        }
-
-        activeGraph = compiled.data;
-        if (hydraClient.isConfigured()) {
-            await hydraClient.syncGraphSnapshot({
-                nodes: activeGraph.nodes,
-                edges: activeGraph.edges
-            });
-        }
-        vectorIndex = await buildVectorIndex(activeGraph, {
-            preferOllama,
-            ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
-            model: options.embedModel ?? config.embedModel
+            return scrubSensitiveStrings(res);
         });
+    }
 
-        return okEnvelope(
-            'hydrascope.ingest_dir',
-            `Compiled ${activeGraph.nodes.length} nodes and ${activeGraph.edges.length} structural edges into HydraDB.`,
-            {
-                workspaceName: activeGraph.workspaceName,
-                nodeCount: activeGraph.nodes.length,
-                edgeCount: activeGraph.edges.length,
-                totalRepoTokens: activeGraph.totalRepoTokens
+    function ingestDirectory(targetDir, { allowExternalPaths = false } = {}) {
+        return withMutationLock(async () => {
+            const cleanTarget = String(targetDir || '').trim();
+            if (!cleanTarget || cleanTarget === 'reset') {
+                const nextGraph = compileArtifactsToGraph(FINTECH_BENCHMARK_CORPUS, {
+                    workspaceName: 'fintech-core'
+                });
+                const nextScenarios = BENCHMARK_SCENARIOS.slice();
+                if (hydraClient.isConfigured()) {
+                    const syncRes = await hydraClient.syncGraphSnapshot({
+                        nodes: nextGraph.nodes,
+                        edges: nextGraph.edges
+                    });
+                    if (syncRes.ok) lastSync = syncRes.data;
+                }
+                const nextVectorIndex = await buildVectorIndex(nextGraph, {
+                    preferOllama,
+                    ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
+                    model: options.embedModel ?? config.embedModel
+                });
+                activeGraph = nextGraph;
+                activeScenarios = nextScenarios;
+                vectorIndex = nextVectorIndex;
+
+                return okEnvelope('hydrascope.ingest_dir', 'Reset workspace to 18-artifact FinTech benchmark graph.', {
+                    workspaceName: activeGraph.workspaceName,
+                    nodeCount: activeGraph.nodes.length,
+                    edgeCount: activeGraph.edges.length,
+                    totalRepoTokens: activeGraph.totalRepoTokens
+                });
             }
-        );
+
+            const candidatePath = path.resolve(projectRoot, cleanTarget);
+            if (
+                !allowExternalPaths &&
+                candidatePath !== projectRoot &&
+                !candidatePath.startsWith(projectRoot + path.sep)
+            ) {
+                return errorEnvelope(
+                    'PATH_OUTSIDE_WORKSPACE',
+                    'HTTP directory compilation is restricted to paths within the project workspace (e.g. "." or "./src"). Use the local CLI (`hydrascope ingest <dir>`) for external paths.',
+                    null,
+                    'hydrascope.ingest_dir'
+                );
+            }
+
+            let lstat;
+            try {
+                lstat = fs.lstatSync(candidatePath);
+            } catch {
+                return errorEnvelope(
+                    'DIRECTORY_NOT_FOUND',
+                    'Target directory does not exist or cannot be accessed.',
+                    null,
+                    'hydrascope.ingest_dir'
+                );
+            }
+
+            if (!allowExternalPaths && lstat.isSymbolicLink()) {
+                return errorEnvelope(
+                    'PATH_OUTSIDE_WORKSPACE',
+                    'Symbolic link directories outside workspace containment are rejected.',
+                    null,
+                    'hydrascope.ingest_dir'
+                );
+            }
+
+            let realRoot;
+            let realTarget;
+            try {
+                realRoot = fs.realpathSync(projectRoot);
+                realTarget = fs.realpathSync(candidatePath);
+            } catch {
+                return errorEnvelope(
+                    'DIRECTORY_NOT_FOUND',
+                    'Target directory does not exist or cannot be accessed.',
+                    null,
+                    'hydrascope.ingest_dir'
+                );
+            }
+
+            if (
+                !allowExternalPaths &&
+                realTarget !== realRoot &&
+                !realTarget.startsWith(realRoot + path.sep)
+            ) {
+                return errorEnvelope(
+                    'PATH_OUTSIDE_WORKSPACE',
+                    'Directory resolves via symlink outside the project workspace.',
+                    null,
+                    'hydrascope.ingest_dir'
+                );
+            }
+
+            const compiled = compileDirectoryToGraph(realTarget, {
+                rejectSymlinkRoot: !allowExternalPaths
+            });
+            if (!compiled.ok) {
+                return scrubSensitiveStrings(compiled);
+            }
+
+            const nextGraph = compiled.data;
+            const nextScenarios =
+                nextGraph.workspaceName === 'fintech-core'
+                    ? BENCHMARK_SCENARIOS.slice()
+                    : buildDynamicScenariosForGraph(nextGraph);
+
+            if (hydraClient.isConfigured()) {
+                const syncRes = await hydraClient.syncGraphSnapshot({
+                    nodes: nextGraph.nodes,
+                    edges: nextGraph.edges
+                });
+                if (syncRes.ok) lastSync = syncRes.data;
+            }
+            const nextVectorIndex = await buildVectorIndex(nextGraph, {
+                preferOllama,
+                ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
+                model: options.embedModel ?? config.embedModel
+            });
+
+            activeGraph = nextGraph;
+            activeScenarios = nextScenarios;
+            vectorIndex = nextVectorIndex;
+
+            return okEnvelope(
+                'hydrascope.ingest_dir',
+                `Compiled ${activeGraph.nodes.length} nodes and ${activeGraph.edges.length} structural edges into HydraDB.`,
+                {
+                    workspaceName: activeGraph.workspaceName,
+                    nodeCount: activeGraph.nodes.length,
+                    edgeCount: activeGraph.edges.length,
+                    totalRepoTokens: activeGraph.totalRepoTokens
+                }
+            );
+        });
     }
 
     return Object.freeze({

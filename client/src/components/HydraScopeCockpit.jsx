@@ -9,6 +9,33 @@ const CATEGORY_META = {
   ungrounded_trap: { label: 'Ungrounded Trap', className: 'hs-cat-trap' }
 };
 
+const ISO_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+const TAB_ORDER = ['arena', 'continual', 'benchmark', 'studio'];
+
+function isValidIsoDate(raw) {
+  if (typeof raw !== 'string') return false;
+  const m = ISO_DATE_RE.exec(raw.trim());
+  if (!m) return false;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === mo - 1 && dt.getUTCDate() === d;
+}
+
+function computeNextAdrId(nodes = [], fallbackPrefix = 'adr') {
+  let maxNum = 24;
+  for (const n of nodes) {
+    const m = /ADR-(\d+)/i.exec(String(n?.id || ''));
+    if (m) {
+      const val = Number.parseInt(m[1], 10);
+      if (Number.isFinite(val) && val > maxNum) maxNum = val;
+    }
+  }
+  const nextCode = `ADR-${String(maxNum + 1).padStart(3, '0')}`;
+  return fallbackPrefix ? `${fallbackPrefix}:${nextCode}` : nextCode;
+}
+
 function unwrapPayload(res) {
   if (res && typeof res === 'object' && res.ok === true && 'data' in res) {
     return res.data;
@@ -248,6 +275,11 @@ function buildSubgraphLayout(hydra, stateEdges = []) {
         y1 = src.cy;
         x2 = dst.cxRight;
         y2 = dst.cy;
+      } else if (src.colIdx === 2) {
+        x1 = src.cxLeft;
+        y1 = src.cy;
+        x2 = dst.cxLeft;
+        y2 = dst.cy;
       } else {
         x1 = src.cxRight;
         y1 = src.cy;
@@ -255,17 +287,25 @@ function buildSubgraphLayout(hydra, stateEdges = []) {
         y2 = dst.cy;
       }
       const dx = Math.max(36, Math.abs(x2 - x1) * 0.45);
+      const sameColOffset = src.colIdx === 2 ? -28 : 26;
       const pathD =
         src.colIdx === dst.colIdx
-          ? `M ${x1} ${y1} C ${x1 + 26} ${y1}, ${x2 + 26} ${y2}, ${x2} ${y2}`
+          ? `M ${x1} ${y1} C ${x1 + sameColOffset} ${y1}, ${x2 + sameColOffset} ${y2}, ${x2} ${y2}`
           : src.colIdx < dst.colIdx
             ? `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`
             : `M ${x1} ${y1} C ${x1 - dx} ${y1}, ${x2 + dx} ${y2}, ${x2} ${y2}`;
 
+      const midX =
+        src.colIdx === dst.colIdx
+          ? src.colIdx === 2
+            ? x1 - 32
+            : x1 + 28
+          : Math.round((x1 + x2) / 2);
+
       return {
         ...edge,
         pathD,
-        midX: Math.round((x1 + x2) / 2),
+        midX,
         midY: Math.round((y1 + y2) / 2) - (edgeIdx % 2 === 0 ? 5 : -10)
       };
     });
@@ -304,6 +344,7 @@ export function HydraScopeCockpit() {
   const [loadConcurrency, setLoadConcurrency] = useState(8);
   const [loadTestResult, setLoadTestResult] = useState(null);
   const [loadTestLoading, setLoadTestLoading] = useState(false);
+  const [loadTestError, setLoadTestError] = useState('');
 
   // Tab 3: 8-Task Benchmark state
   const [benchResult, setBenchResult] = useState(null);
@@ -330,6 +371,9 @@ export function HydraScopeCockpit() {
   const continualAbortRef = useRef(null);
   const loadTestAbortRef = useRef(null);
   const benchAbortRef = useRef(null);
+  const studioAbortRef = useRef(null);
+  const userEditedQueryRef = useRef(false);
+  const tabButtonRefs = useRef({});
   const initializedRef = useRef(false);
 
   const cypherClipboard = useCopyToClipboard({ timeout: 1800 });
@@ -346,39 +390,64 @@ export function HydraScopeCockpit() {
     return map;
   }, [workspaceState]);
 
+  const activeDecisions = useMemo(
+    () => (workspaceState?.decisions || []).filter((d) => d.isCurrent !== false),
+    [workspaceState]
+  );
+
   const syncDefaultSupersedeTarget = useCallback((stateData) => {
     const decisions = Array.isArray(stateData?.decisions) ? stateData.decisions : [];
     const edges = Array.isArray(stateData?.edges) ? stateData.edges : [];
-    if (decisions.length === 0) return;
+    const currentOnly = decisions.filter((d) => d.isCurrent !== false);
+    if (currentOnly.length === 0) {
+      setSupersedeForm((prev) => ({
+        ...prev,
+        oldId: ''
+      }));
+      return;
+    }
 
     const preferred =
-      decisions.find((d) => d.isCurrent !== false && String(d.id).includes('ADR-014')) ||
-      decisions.find((d) => d.isCurrent !== false) ||
-      decisions[0];
+      currentOnly.find((d) => String(d.id).includes('ADR-014')) || currentOnly[0];
 
     if (!preferred?.id) return;
 
     const governed = edges
       .filter((e) => e.from === preferred.id && String(e.type).toUpperCase() === 'GOVERNS')
       .map((e) => e.to);
+    const prefix = preferred.id.includes(':') ? preferred.id.split(':')[0] : 'adr';
+    const nextAdrId = computeNextAdrId(stateData?.nodes || decisions, prefix);
 
     setSupersedeForm((prev) => ({
       ...prev,
       oldId: preferred.id,
+      newId: nextAdrId,
       governsInput: governed.length > 0 ? governed.join(', ') : prev.governsInput
     }));
   }, []);
 
   const runArenaComparison = useCallback(
-    async ({ query, asOf, budget, k, scenarioId }) => {
+    async ({ query, asOf, budget, k, scenarioId, externalSignal }) => {
       const trimmed = String(query || '').trim();
       if (!trimmed) return;
+
+      const cleanAsOf = asOf && String(asOf).trim() ? String(asOf).trim() : null;
+      if (cleanAsOf && !isValidIsoDate(cleanAsOf)) {
+        setGlobalError(`Invalid asOf date "${cleanAsOf}". Expected valid calendar date in YYYY-MM-DD format.`);
+        return;
+      }
 
       if (arenaAbortRef.current) {
         arenaAbortRef.current.abort();
       }
       const controller = new AbortController();
       arenaAbortRef.current = controller;
+
+      const onExternalAbort = () => controller.abort();
+      if (externalSignal) {
+        if (externalSignal.aborted) return;
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
 
       setArenaLoading(true);
       setGlobalError('');
@@ -391,7 +460,7 @@ export function HydraScopeCockpit() {
           method: 'POST',
           body: {
             query: trimmed,
-            asOf: asOf && String(asOf).trim() ? String(asOf).trim() : null,
+            asOf: cleanAsOf,
             tokenBudget: Number(budget) || 900,
             topK: Number(k) || 5
           },
@@ -412,6 +481,10 @@ export function HydraScopeCockpit() {
         if (controller.signal.aborted || err?.name === 'AbortError') return;
         setGlobalError(err?.message || 'Arena head-to-head comparison failed.');
         setArenaLoading(false);
+      } finally {
+        if (externalSignal) {
+          externalSignal.removeEventListener('abort', onExternalAbort);
+        }
       }
     },
     []
@@ -510,6 +583,7 @@ export function HydraScopeCockpit() {
       }
 
       setLoadTestLoading(true);
+      setLoadTestError('');
       setGlobalError('');
       try {
         const raw = await fetchApiJson('/api/benchmark/load', {
@@ -530,7 +604,9 @@ export function HydraScopeCockpit() {
         return null;
       } catch (err) {
         if (controller.signal.aborted || err?.name === 'AbortError') return null;
-        setGlobalError(err?.message || 'Concurrent OpenCypher load test failed.');
+        const msg = err?.message || 'Concurrent OpenCypher load test failed.';
+        setLoadTestError(msg);
+        setGlobalError(msg);
         setLoadTestLoading(false);
         return null;
       } finally {
@@ -583,25 +659,25 @@ export function HydraScopeCockpit() {
           const initAsOf = firstScenario?.asOf || '';
           const initBudget = firstScenario?.tokenBudget || 900;
 
-          setSelectedScenarioId(firstScenario?.id || '');
-          setQueryInput(initQuery);
-          setAsOfInput(initAsOf);
-          setTokenBudget(initBudget);
-
-          await runArenaComparison({
-            query: initQuery,
-            asOf: initAsOf,
-            budget: initBudget,
-            k: 5,
-            scenarioId: firstScenario?.id || ''
-          });
-
-          if (!controller.signal.aborted) {
-            await runContinualLoop(controller.signal);
+          if (!userEditedQueryRef.current) {
+            setSelectedScenarioId(firstScenario?.id || '');
+            setQueryInput(initQuery);
+            setAsOfInput(initAsOf);
+            setTokenBudget(initBudget);
           }
-          if (!controller.signal.aborted) {
-            runLiveBenchmark(controller.signal);
-          }
+
+          await Promise.all([
+            runArenaComparison({
+              query: initQuery,
+              asOf: initAsOf,
+              budget: initBudget,
+              k: 5,
+              scenarioId: firstScenario?.id || '',
+              externalSignal: controller.signal
+            }),
+            runContinualLoop(controller.signal),
+            runLiveBenchmark(controller.signal)
+          ]);
         }
       } catch (err) {
         if (controller.signal.aborted || err?.name === 'AbortError') return;
@@ -618,8 +694,28 @@ export function HydraScopeCockpit() {
       continualAbortRef.current?.abort();
       loadTestAbortRef.current?.abort();
       benchAbortRef.current?.abort();
+      studioAbortRef.current?.abort();
     };
-  }, [reloadWorkspaceState, runArenaComparison, runLiveBenchmark, syncDefaultSupersedeTarget]);
+  }, [reloadWorkspaceState, runArenaComparison, runContinualLoop, runLiveBenchmark, syncDefaultSupersedeTarget]);
+
+  const handleTabKeyDown = (event, currentKey) => {
+    const idx = TAB_ORDER.indexOf(currentKey);
+    if (idx === -1) return;
+    let nextIdx = -1;
+    if (event.key === 'ArrowRight') nextIdx = (idx + 1) % TAB_ORDER.length;
+    else if (event.key === 'ArrowLeft') nextIdx = (idx - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+    else if (event.key === 'Home') nextIdx = 0;
+    else if (event.key === 'End') nextIdx = TAB_ORDER.length - 1;
+    if (nextIdx === -1) return;
+
+    event.preventDefault();
+    const nextTab = TAB_ORDER[nextIdx];
+    setActiveTab(nextTab);
+    if (nextTab === 'benchmark' && !benchResult && !benchLoading) {
+      runLiveBenchmark();
+    }
+    tabButtonRefs.current[nextTab]?.focus();
+  };
 
   const handleSelectScenario = (scenario) => {
     if (!scenario) return;
@@ -653,6 +749,32 @@ export function HydraScopeCockpit() {
     }
   };
 
+  const handleBudgetChange = (nextBudget) => {
+    setTokenBudget(nextBudget);
+    if (queryInput.trim()) {
+      runArenaComparison({
+        query: queryInput,
+        asOf: asOfInput,
+        budget: nextBudget,
+        k: topK,
+        scenarioId: selectedScenarioId
+      });
+    }
+  };
+
+  const handleTopKChange = (nextK) => {
+    setTopK(nextK);
+    if (queryInput.trim()) {
+      runArenaComparison({
+        query: queryInput,
+        asOf: asOfInput,
+        budget: tokenBudget,
+        k: nextK,
+        scenarioId: selectedScenarioId
+      });
+    }
+  };
+
   const handleArenaFormSubmit = (event) => {
     event.preventDefault();
     runArenaComparison({
@@ -679,6 +801,16 @@ export function HydraScopeCockpit() {
 
   const handleSupersedeSubmit = async (event) => {
     event.preventDefault();
+    const cleanEff = supersedeForm.effectiveAt.trim() || '2026-11-15';
+    if (!isValidIsoDate(cleanEff)) {
+      setGlobalError(`Invalid effectiveAt date "${cleanEff}". Expected valid calendar date in YYYY-MM-DD format.`);
+      return;
+    }
+
+    studioAbortRef.current?.abort();
+    const controller = new AbortController();
+    studioAbortRef.current = controller;
+
     setSupersedeLoading(true);
     setSupersedeStatus(null);
     setGlobalError('');
@@ -689,33 +821,64 @@ export function HydraScopeCockpit() {
       .filter(Boolean);
 
     try {
+      const submittedOldId = supersedeForm.oldId.trim();
+      const submittedNewId = supersedeForm.newId.trim();
+      const submittedTitle = supersedeForm.title.trim();
+
       const raw = await fetchApiJson('/api/decisions/supersede', {
         method: 'POST',
         body: {
-          oldId: supersedeForm.oldId.trim(),
-          newId: supersedeForm.newId.trim(),
-          title: supersedeForm.title.trim(),
+          oldId: submittedOldId,
+          newId: submittedNewId,
+          title: submittedTitle,
           content: supersedeForm.content.trim(),
           governsIds,
-          effectiveAt: supersedeForm.effectiveAt.trim() || '2026-11-15'
+          effectiveAt: cleanEff
         },
+        signal: controller.signal,
         timeoutMs: 25000
       });
       const resultData = unwrapPayload(raw);
-      const refreshedState = await reloadWorkspaceState();
+      const refreshedState = await reloadWorkspaceState(controller.signal);
+      if (controller.signal.aborted) return;
+
+      const createdId = resultData?.newNode?.id || submittedNewId;
+      const prefix = createdId.includes(':') ? createdId.split(':')[0] : 'adr';
+      const nextUnusedId = computeNextAdrId(refreshedState?.nodes || [], prefix);
+      const nextBareCode = nextUnusedId.replace(/^[a-z_]+:/i, '');
+
+      setSupersedeForm((prev) => ({
+        ...prev,
+        oldId: createdId,
+        newId: nextUnusedId,
+        title: prev.title.replace(/^ADR-\d+/i, nextBareCode)
+      }));
+
       setSupersedeStatus({
-        newId: supersedeForm.newId.trim(),
-        oldId: supersedeForm.oldId.trim(),
-        title: supersedeForm.title.trim(),
+        newId: createdId,
+        oldId: submittedOldId,
+        title: submittedTitle,
         governsIds,
         details: resultData,
         nodeCount: refreshedState?.nodeCount
       });
       runLiveBenchmark();
+      if (queryInput.trim()) {
+        runArenaComparison({
+          query: queryInput,
+          asOf: asOfInput,
+          budget: tokenBudget,
+          k: topK,
+          scenarioId: selectedScenarioId
+        });
+      }
     } catch (err) {
+      if (controller.signal.aborted || err?.name === 'AbortError') return;
       setGlobalError(err?.message || 'Failed to write :SUPERSEDES decision edge.');
     } finally {
-      setSupersedeLoading(false);
+      if (!controller.signal.aborted) {
+        setSupersedeLoading(false);
+      }
     }
   };
 
@@ -737,27 +900,73 @@ export function HydraScopeCockpit() {
   };
 
   const handleIngestDirectory = async (dirPath) => {
+    studioAbortRef.current?.abort();
+    const controller = new AbortController();
+    studioAbortRef.current = controller;
+
     setIngestLoading(true);
     setIngestStatus(null);
+    setSupersedeStatus(null);
     setGlobalError('');
     try {
+      const normalizedDir = dirPath === '' ? 'reset' : dirPath;
       const raw = await fetchApiJson('/api/workspace/ingest-dir', {
         method: 'POST',
-        body: { targetDir: dirPath },
+        body: { targetDir: normalizedDir },
+        signal: controller.signal,
         timeoutMs: 30000
       });
       const ingestData = unwrapPayload(raw);
-      const refreshed = await reloadWorkspaceState();
+      const refreshed = await reloadWorkspaceState(controller.signal);
+      if (controller.signal.aborted) return;
+
       syncDefaultSupersedeTarget(refreshed);
+      setSelectedSvgNodeId('');
+      setArenaResult(null);
+      setBenchResult(null);
+
+      const nextFirstScenario =
+        Array.isArray(refreshed?.scenarios) && refreshed.scenarios.length > 0
+          ? refreshed.scenarios[0]
+          : null;
+      const fallbackNode = refreshed?.nodes?.[0];
+      const nextQuery =
+        nextFirstScenario?.query ||
+        (fallbackNode
+          ? `What downstream modules and callers are impacted if I modify ${fallbackNode.title || fallbackNode.id}?`
+          : '');
+      const nextAsOf = nextFirstScenario?.asOf || '';
+      const nextBudget = nextFirstScenario?.tokenBudget || 900;
+
+      setSelectedScenarioId(nextFirstScenario?.id || '');
+      setQueryInput(nextQuery);
+      setAsOfInput(nextAsOf);
+      setTokenBudget(nextBudget);
+
       setIngestStatus({
-        workspaceName: refreshed?.workspaceName || ingestData?.workspaceName || dirPath || 'workspace',
+        workspaceName:
+          refreshed?.workspaceName || ingestData?.workspaceName || normalizedDir || 'workspace',
         nodeCount: refreshed?.nodeCount ?? ingestData?.nodeCount ?? 0,
         edgeCount: refreshed?.edgeCount ?? ingestData?.edgeCount ?? 0
       });
+
+      if (nextQuery) {
+        runArenaComparison({
+          query: nextQuery,
+          asOf: nextAsOf,
+          budget: nextBudget,
+          k: topK,
+          scenarioId: nextFirstScenario?.id || ''
+        });
+      }
+      runLiveBenchmark();
     } catch (err) {
+      if (controller.signal.aborted || err?.name === 'AbortError') return;
       setGlobalError(err?.message || 'Directory compilation failed.');
     } finally {
-      setIngestLoading(false);
+      if (!controller.signal.aborted) {
+        setIngestLoading(false);
+      }
     }
   };
 
@@ -792,15 +1001,21 @@ export function HydraScopeCockpit() {
     (kpiVectorTokens > 0 ? Math.round(((kpiVectorTokens - kpiHydraTokens) / kpiVectorTokens) * 1000) / 10 : 0);
 
   const rankedChunks = Array.isArray(vectorData.rankedChunks) ? vectorData.rankedChunks : [];
+  const displayedVectorChunks = useMemo(
+    () => rankedChunks.filter((c) => c.selected !== false),
+    [rankedChunks]
+  );
+  const effectiveTopK = displayedVectorChunks.length || topK;
+
   const vectorPoisonedList = useMemo(() => {
-    if (Array.isArray(arenaResult?.vectorPoisonedNodes) && arenaResult.vectorPoisonedNodes.length > 0) {
+    if (Array.isArray(arenaResult?.vectorPoisonedNodes)) {
       return arenaResult.vectorPoisonedNodes.map((item) => {
         const id = normalizeId(item);
         return typeof item === 'object' ? item : nodeLookup.get(id) || { id, title: id };
       });
     }
-    return rankedChunks.filter((c) => c.isCurrent === false || Boolean(c.retiredAt));
-  }, [arenaResult, rankedChunks, nodeLookup]);
+    return displayedVectorChunks.filter((c) => c.isCurrent === false || Boolean(c.retiredAt));
+  }, [arenaResult, displayedVectorChunks, nodeLookup]);
 
   const structuralOnlyList = useMemo(() => {
     const rawList = Array.isArray(arenaResult?.structuralOnlyNodes) ? arenaResult.structuralOnlyNodes : [];
@@ -910,31 +1125,51 @@ export function HydraScopeCockpit() {
         <div className="hs-nav-bar">
           <div className="hs-tabs" role="tablist" aria-label="HydraScope navigation">
             <button
+              ref={(el) => {
+                tabButtonRefs.current.arena = el;
+              }}
+              id="hs-tab-arena"
               type="button"
               role="tab"
               aria-selected={activeTab === 'arena'}
+              aria-controls="hs-panel-arena"
+              tabIndex={activeTab === 'arena' ? 0 : -1}
               className={`hs-tab-btn ${activeTab === 'arena' ? 'is-active' : ''}`}
               onClick={() => setActiveTab('arena')}
+              onKeyDown={(e) => handleTabKeyDown(e, 'arena')}
             >
               <span className="hs-tab-index">01</span>
               Vector vs. HydraDB Arena
             </button>
 
             <button
+              ref={(el) => {
+                tabButtonRefs.current.continual = el;
+              }}
+              id="hs-tab-continual"
               type="button"
               role="tab"
               aria-selected={activeTab === 'continual'}
+              aria-controls="hs-panel-continual"
+              tabIndex={activeTab === 'continual' ? 0 : -1}
               className={`hs-tab-btn ${activeTab === 'continual' ? 'is-active' : ''}`}
               onClick={() => setActiveTab('continual')}
+              onKeyDown={(e) => handleTabKeyDown(e, 'continual')}
             >
               <span className="hs-tab-index">02</span>
               64-Tool Continual Learning &amp; Load
             </button>
 
             <button
+              ref={(el) => {
+                tabButtonRefs.current.benchmark = el;
+              }}
+              id="hs-tab-benchmark"
               type="button"
               role="tab"
               aria-selected={activeTab === 'benchmark'}
+              aria-controls="hs-panel-benchmark"
+              tabIndex={activeTab === 'benchmark' ? 0 : -1}
               className={`hs-tab-btn ${activeTab === 'benchmark' ? 'is-active' : ''}`}
               onClick={() => {
                 setActiveTab('benchmark');
@@ -942,17 +1177,25 @@ export function HydraScopeCockpit() {
                   runLiveBenchmark();
                 }
               }}
+              onKeyDown={(e) => handleTabKeyDown(e, 'benchmark')}
             >
               <span className="hs-tab-index">03</span>
-              Proof-Over-Vectors Benchmark (8 Tasks)
+              Proof-Over-Vectors Benchmark ({scenarios.length || 8} Tasks)
             </button>
 
             <button
+              ref={(el) => {
+                tabButtonRefs.current.studio = el;
+              }}
+              id="hs-tab-studio"
               type="button"
               role="tab"
               aria-selected={activeTab === 'studio'}
+              aria-controls="hs-panel-studio"
+              tabIndex={activeTab === 'studio' ? 0 : -1}
               className={`hs-tab-btn ${activeTab === 'studio' ? 'is-active' : ''}`}
               onClick={() => setActiveTab('studio')}
+              onKeyDown={(e) => handleTabKeyDown(e, 'studio')}
             >
               <span className="hs-tab-index">04</span>
               Live Graph Studio &amp; Time-Travel ADRs
@@ -971,7 +1214,12 @@ export function HydraScopeCockpit() {
 
         {/* TAB 1: VECTOR VS. HYDRADB ARENA */}
         {activeTab === 'arena' && (
-          <div className="hs-section-stack">
+          <div
+            id="hs-panel-arena"
+            role="tabpanel"
+            aria-labelledby="hs-tab-arena"
+            className="hs-section-stack"
+          >
             {/* Scenario Preset Strip + Query & Time-Travel Bar */}
             <section className="hs-card" aria-label="Scenario presets and query controls">
               <div className="hs-preset-header">
@@ -993,6 +1241,7 @@ export function HydraScopeCockpit() {
                     <button
                       key={scenario.id}
                       type="button"
+                      aria-pressed={isSelected}
                       className={`hs-preset-pill ${isSelected ? 'is-selected' : ''}`}
                       onClick={() => handleSelectScenario(scenario)}
                     >
@@ -1012,10 +1261,14 @@ export function HydraScopeCockpit() {
 
               <form className="hs-query-form" onSubmit={handleArenaFormSubmit}>
                 <input
+                  id="hs-query-input"
                   type="text"
                   className="hs-input"
                   value={queryInput}
-                  onChange={(e) => setQueryInput(e.target.value)}
+                  onChange={(e) => {
+                    userEditedQueryRef.current = true;
+                    setQueryInput(e.target.value);
+                  }}
                   placeholder="Ask an architectural, blast-radius, or ADR governance question..."
                   aria-label="Engineering query"
                 />
@@ -1030,9 +1283,12 @@ export function HydraScopeCockpit() {
 
               <div className="hs-controls-subrow">
                 <div className="hs-timetravel-group">
-                  <span className="hs-inline-label">Temporal Replay (asOf):</span>
+                  <label htmlFor="hs-asof-input" className="hs-inline-label">
+                    Temporal Replay (asOf):
+                  </label>
                   <button
                     type="button"
+                    aria-pressed={!asOfInput}
                     className={`hs-btn hs-btn-mini ${!asOfInput ? 'is-active' : ''}`}
                     onClick={() => handleQuickTimeTravel('')}
                   >
@@ -1040,6 +1296,7 @@ export function HydraScopeCockpit() {
                   </button>
                   <button
                     type="button"
+                    aria-pressed={asOfInput === '2026-03-01'}
                     className={`hs-btn hs-btn-mini ${asOfInput === '2026-03-01' ? 'is-active' : ''}`}
                     onClick={() => handleQuickTimeTravel('2026-03-01')}
                     title="Replay graph as of 2026-03-01 before ADR-003 was retired"
@@ -1047,7 +1304,9 @@ export function HydraScopeCockpit() {
                     Time-Travel: 2026-03-01
                   </button>
                   <input
+                    id="hs-asof-input"
                     type="text"
+                    pattern="\d{4}-\d{2}-\d{2}"
                     className="hs-input hs-date-input"
                     value={asOfInput}
                     onChange={(e) => setAsOfInput(e.target.value)}
@@ -1057,24 +1316,26 @@ export function HydraScopeCockpit() {
                 </div>
 
                 <div className="hs-budget-group">
-                  <label className="hs-inline-label">
+                  <label htmlFor="hs-budget-select" className="hs-inline-label">
                     Budget:
                     <select
+                      id="hs-budget-select"
                       className="hs-select hs-mini-select"
                       value={tokenBudget}
-                      onChange={(e) => setTokenBudget(Number(e.target.value))}
+                      onChange={(e) => handleBudgetChange(Number(e.target.value))}
                     >
                       <option value={600}>600 tok</option>
                       <option value={900}>900 tok</option>
                       <option value={1400}>1,400 tok</option>
                     </select>
                   </label>
-                  <label className="hs-inline-label">
+                  <label htmlFor="hs-topk-select" className="hs-inline-label">
                     Vector Top-K:
                     <select
+                      id="hs-topk-select"
                       className="hs-select hs-mini-select"
                       value={topK}
-                      onChange={(e) => setTopK(Number(e.target.value))}
+                      onChange={(e) => handleTopKChange(Number(e.target.value))}
                     >
                       <option value={3}>Top 3</option>
                       <option value={5}>Top 5</option>
@@ -1110,7 +1371,7 @@ export function HydraScopeCockpit() {
               </div>
 
               <div className="hs-kpi-card">
-                <span className="hs-kpi-label">Vector Top-{topK} Tokens</span>
+                <span className="hs-kpi-label">Vector Top-{effectiveTopK} Tokens</span>
                 <span className="hs-kpi-value">{formatNum(kpiVectorTokens)} tok</span>
                 <span className="hs-kpi-sub">
                   Cosine chunks ({vectorData.latencyMs ?? 0}ms)
@@ -1227,9 +1488,12 @@ export function HydraScopeCockpit() {
                     <svg
                       viewBox="0 0 760 240"
                       className="hs-subgraph-svg"
-                      role="img"
-                      aria-label="HydraDB traversed nodes and edges layered from seeds to multi-hop governance"
+                      role="group"
+                      aria-labelledby="hs-subgraph-title"
                     >
+                      <title id="hs-subgraph-title">
+                        HydraDB traversed nodes and edges layered from seeds to multi-hop governance
+                      </title>
                       <defs>
                         <marker
                           id="hs-arrow-emerald"
@@ -1282,15 +1546,30 @@ export function HydraScopeCockpit() {
                       <line x1="508" y1="10" x2="508" y2="232" stroke="#1e293b" strokeDasharray="3 4" />
 
                       {/* Column Titles */}
-                      <text x="24" y="22" fill="#64748b" fontSize="10" fontFamily="monospace" fontWeight="700">
+                      <text x="24" y="22" fill="#94a3b8" fontSize="10" fontFamily="monospace" fontWeight="700">
                         01. SEED ENTRYPOINTS
                       </text>
-                      <text x="280" y="22" fill="#64748b" fontSize="10" fontFamily="monospace" fontWeight="700">
+                      <text x="280" y="22" fill="#94a3b8" fontSize="10" fontFamily="monospace" fontWeight="700">
                         02. HOP 1 DIRECT / GOVERNS
                       </text>
-                      <text x="536" y="22" fill="#64748b" fontSize="10" fontFamily="monospace" fontWeight="700">
+                      <text x="536" y="22" fill="#94a3b8" fontSize="10" fontFamily="monospace" fontWeight="700">
                         03. HOP 2+ / ADR LINEAGE
                       </text>
+
+                      {subgraphLayout.positionedNodes.length === 0 && (
+                        <text
+                          x="380"
+                          y="132"
+                          textAnchor="middle"
+                          fill="#94a3b8"
+                          fontSize="11"
+                          fontFamily="monospace"
+                        >
+                          {arenaLoading
+                            ? 'Traversing structural OpenCypher subgraph...'
+                            : 'No active structural nodes matched at the selected timestamp.'}
+                        </text>
+                      )}
 
                       {/* Directed Edges */}
                       {subgraphLayout.positionedEdges.map((edge, idx) => {
@@ -1367,7 +1646,17 @@ export function HydraScopeCockpit() {
                           <g
                             key={node.id}
                             className="hs-svg-node-group"
+                            role="button"
+                            tabIndex={0}
+                            aria-pressed={isSelected}
+                            aria-label={`${node.title || node.id} (${subLabel})`}
                             onClick={() => setSelectedSvgNodeId(node.id)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' || e.key === ' ') {
+                                e.preventDefault();
+                                setSelectedSvgNodeId(node.id);
+                              }
+                            }}
                           >
                             <rect
                               x={node.x}
@@ -1468,7 +1757,7 @@ export function HydraScopeCockpit() {
               <div className="hs-col-card hs-col-vector">
                 <div className="hs-col-header">
                   <div>
-                    <h2 className="hs-col-title">Dense Cosine Vector Store (Top-{topK})</h2>
+                    <h2 className="hs-col-title">Dense Cosine Vector Store (Top-{effectiveTopK})</h2>
                     <p className="hs-col-subtitle">
                       Backend: {vectorData.embeddingBackend || embeddingBackend} |{' '}
                       {formatNum(vectorData.tokenCount)} tok | {vectorData.latencyMs ?? 0}ms
@@ -1479,7 +1768,7 @@ export function HydraScopeCockpit() {
                       {vectorPoisonedList.length} POISONED ADR
                     </span>
                   ) : (
-                    <span className="hs-badge hs-badge-slate">Cosine Top-{topK}</span>
+                    <span className="hs-badge hs-badge-slate">Cosine Top-{effectiveTopK}</span>
                   )}
                 </div>
 
@@ -1503,15 +1792,15 @@ export function HydraScopeCockpit() {
                 )}
 
                 <div className="hs-chunk-list">
-                  {rankedChunks.length === 0 ? (
+                  {displayedVectorChunks.length === 0 ? (
                     <div className="hs-chunk-item">No vector chunks returned.</div>
                   ) : (
-                    rankedChunks.map((chunk, idx) => {
+                    displayedVectorChunks.map((chunk, idx) => {
                       const isRetiredAtHead = !effectiveAsOf && (chunk.isCurrent === false || Boolean(chunk.retiredAt));
                       const isRetiredAtAsOf =
                         Boolean(effectiveAsOf) &&
-                        Boolean(chunk.retiredAt) &&
-                        String(chunk.retiredAt) <= String(effectiveAsOf);
+                        ((Boolean(chunk.retiredAt) && String(chunk.retiredAt) <= String(effectiveAsOf)) ||
+                          (Boolean(chunk.validFrom) && String(chunk.validFrom) > String(effectiveAsOf)));
                       const isPoisoned = isRetiredAtHead || isRetiredAtAsOf;
 
                       return (
@@ -1551,6 +1840,7 @@ export function HydraScopeCockpit() {
                 <div>
                   <button
                     type="button"
+                    aria-expanded={showVectorRawContext}
                     className="hs-btn hs-btn-mini"
                     onClick={() => setShowVectorRawContext((prev) => !prev)}
                   >
@@ -1689,6 +1979,7 @@ export function HydraScopeCockpit() {
                       )}
                       <button
                         type="button"
+                        aria-expanded={showCypherInspector}
                         className="hs-btn hs-btn-mini"
                         onClick={() => setShowCypherInspector((prev) => !prev)}
                       >
@@ -1744,7 +2035,12 @@ export function HydraScopeCockpit() {
 
         {/* TAB 2: 64-TOOL CONTINUAL LEARNING & CONCURRENT HYDRADB LOAD */}
         {activeTab === 'continual' && (
-          <div className="hs-section-stack">
+          <div
+            id="hs-panel-continual"
+            role="tabpanel"
+            aria-labelledby="hs-tab-continual"
+            className="hs-section-stack"
+          >
             {(() => {
               const cat = continualResult?.catalogSummary || {
                 mcpServers: 8,
@@ -1926,8 +2222,11 @@ export function HydraScopeCockpit() {
                         viewBox="0 0 760 255"
                         className="hs-subgraph-svg"
                         role="img"
-                        aria-label="Four-epoch continual learning F1 and single-turn readiness curve compared against flat Vector Tool-RAG baseline"
+                        aria-labelledby="hs-continual-chart-title"
                       >
+                        <title id="hs-continual-chart-title">
+                          Four-epoch continual learning F1 and single-turn readiness curve compared against flat Vector Tool-RAG baseline
+                        </title>
                         <defs>
                           <linearGradient id="hs-f1-area-grad" x1="0" y1="0" x2="0" y2="1">
                             <stop offset="0%" stopColor="#10b981" stopOpacity="0.28" />
@@ -1952,7 +2251,7 @@ export function HydraScopeCockpit() {
                                 x={plotLeft - 10}
                                 y={y + 3.5}
                                 textAnchor="end"
-                                fill="#64748b"
+                                fill="#94a3b8"
                                 fontSize="9.5"
                                 fontFamily="monospace"
                               >
@@ -2375,6 +2674,19 @@ export function HydraScopeCockpit() {
                       </div>
                     </div>
 
+                    {loadTestError && (
+                      <div className="hs-error-banner" role="alert" style={{ marginTop: '0.85rem' }}>
+                        <span>Load Test: {loadTestError}</span>
+                        <button
+                          type="button"
+                          className="hs-btn hs-btn-mini"
+                          onClick={() => setLoadTestError('')}
+                        >
+                          Dismiss
+                        </button>
+                      </div>
+                    )}
+
                     {loadTestResult ? (
                       <>
                         <div className="hs-load-grid">
@@ -2478,17 +2790,23 @@ export function HydraScopeCockpit() {
           </div>
         )}
 
-        {/* TAB 3: PROOF-OVER-VECTORS BENCHMARK (8 TASKS) */}
+        {/* TAB 3: PROOF-OVER-VECTORS BENCHMARK */}
         {activeTab === 'benchmark' && (
-          <div className="hs-section-stack">
+          <div
+            id="hs-panel-benchmark"
+            role="tabpanel"
+            aria-labelledby="hs-tab-benchmark"
+            className="hs-section-stack"
+          >
             <section className="hs-card hs-bench-banner">
               <div>
                 <h2 className="hs-bench-quote">
                   &ldquo;One Rule: It Has to Earn Its Place Over a Vector Store&rdquo;
                 </h2>
                 <p className="hs-bench-sub">
-                  Live 8-scenario deterministic benchmark comparing Full-Repo Stuffing, Dense Vector
-                  Top-K ({benchResult?.embeddingBackend || embeddingBackend}), and HydraDB Structural
+                  Live {benchResult?.scenarioCount ?? (scenarios.length || 8)}-scenario deterministic
+                  benchmark comparing Full-Repo Stuffing, Dense Vector Top-K (
+                  {benchResult?.embeddingBackend || embeddingBackend}), and HydraDB Structural
                   Traversal across multi-hop recall, temporal ADR poisoning, and trap blocking.
                 </p>
               </div>
@@ -2498,7 +2816,9 @@ export function HydraScopeCockpit() {
                 onClick={() => runLiveBenchmark()}
                 disabled={benchLoading}
               >
-                {benchLoading ? 'Running 8-Task Suite...' : 'Run Live 8-Task Suite'}
+                {benchLoading
+                  ? 'Running Benchmark Suite...'
+                  : `Run Live ${scenarios.length || 8}-Task Suite`}
               </button>
             </section>
 
@@ -2649,21 +2969,31 @@ export function HydraScopeCockpit() {
                       const matchingPreset = scenarios.find((s) => s.id === row.id);
                       const isTrapTask = row.answerableExpected === false || row.category === 'ungrounded_trap';
 
+                      const activateScenarioRow = () =>
+                        handleSelectScenario(
+                          matchingPreset || {
+                            id: row.id,
+                            category: row.category,
+                            title: row.title,
+                            query: row.query,
+                            asOf: row.asOf || ''
+                          }
+                        );
+
                       return (
                         <tr
                           key={row.id}
                           className="hs-table-row-clickable"
-                          onClick={() =>
-                            handleSelectScenario(
-                              matchingPreset || {
-                                id: row.id,
-                                category: row.category,
-                                title: row.title,
-                                query: row.query,
-                                asOf: row.asOf || ''
-                              }
-                            )
-                          }
+                          tabIndex={0}
+                          role="button"
+                          aria-label={`Inspect scenario ${row.title} in Arena`}
+                          onClick={activateScenarioRow}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              activateScenarioRow();
+                            }
+                          }}
                         >
                           <td>
                             <strong style={{ color: '#f8fafc' }}>{row.title}</strong>
@@ -2740,9 +3070,14 @@ export function HydraScopeCockpit() {
           </div>
         )}
 
-        {/* TAB 3: LIVE GRAPH STUDIO & TIME-TRAVEL ADRS */}
+        {/* TAB 4: LIVE GRAPH STUDIO & TIME-TRAVEL ADRS */}
         {activeTab === 'studio' && (
-          <div className="hs-studio-grid">
+          <div
+            id="hs-panel-studio"
+            role="tabpanel"
+            aria-labelledby="hs-tab-studio"
+            className="hs-studio-grid"
+          >
             {/* Panel A: Supersede Decision Live */}
             <section className="hs-card" aria-label="Live ADR supersession studio">
               <div className="hs-preset-header">
@@ -2771,32 +3106,48 @@ export function HydraScopeCockpit() {
                 </div>
               )}
 
+              {activeDecisions.length === 0 ? (
+                <div className="hs-scenario-note" style={{ marginBottom: '0.9rem' }}>
+                  <strong style={{ color: '#e2e8f0' }}>No Active ADR Artifacts in Compiled Directory: </strong>
+                  Workspace <code>{workspaceState?.workspaceName || 'custom'}</code> contains code/module
+                  nodes without Markdown ADR records. Reset to the 18-artifact FinTech workspace to
+                  test live <code>:SUPERSEDES</code> lineage mutations.
+                  <div style={{ marginTop: '0.6rem' }}>
+                    <button
+                      type="button"
+                      className="hs-btn hs-btn-mini hs-btn-cyan"
+                      disabled={ingestLoading}
+                      onClick={() => {
+                        setIngestDirInput('.');
+                        handleIngestDirectory('reset');
+                      }}
+                    >
+                      Reset FinTech Workspace
+                    </button>
+                  </div>
+                </div>
+              ) : null}
+
               <form className="hs-form-grid" onSubmit={handleSupersedeSubmit}>
                 <div className="hs-form-row-2">
                   <label className="hs-field-label">
                     Active ADR to Supersede (oldId)
-                    {(workspaceState?.decisions || []).length > 0 ? (
-                      <select
-                        className="hs-select"
-                        value={supersedeForm.oldId}
-                        onChange={(e) => handleOldDecisionChange(e.target.value)}
-                      >
-                        {(workspaceState?.decisions || []).map((dec) => (
+                    <select
+                      className="hs-select"
+                      value={supersedeForm.oldId}
+                      disabled={activeDecisions.length === 0}
+                      onChange={(e) => handleOldDecisionChange(e.target.value)}
+                    >
+                      {activeDecisions.length === 0 ? (
+                        <option value="">No active ADRs in current workspace</option>
+                      ) : (
+                        activeDecisions.map((dec) => (
                           <option key={dec.id} value={dec.id}>
-                            {dec.id} ({dec.isCurrent !== false ? 'ACTIVE' : 'RETIRED'})
+                            {dec.id} (ACTIVE)
                           </option>
-                        ))}
-                      </select>
-                    ) : (
-                      <input
-                        type="text"
-                        className="hs-input"
-                        value={supersedeForm.oldId}
-                        onChange={(e) =>
-                          setSupersedeForm((p) => ({ ...p, oldId: e.target.value }))
-                        }
-                      />
-                    )}
+                        ))
+                      )}
+                    </select>
                   </label>
 
                   <label className="hs-field-label">
@@ -2805,6 +3156,7 @@ export function HydraScopeCockpit() {
                       type="text"
                       className="hs-input"
                       value={supersedeForm.newId}
+                      disabled={activeDecisions.length === 0}
                       onChange={(e) =>
                         setSupersedeForm((p) => ({ ...p, newId: e.target.value }))
                       }
@@ -2820,6 +3172,7 @@ export function HydraScopeCockpit() {
                       type="text"
                       className="hs-input"
                       value={supersedeForm.title}
+                      disabled={activeDecisions.length === 0}
                       onChange={(e) =>
                         setSupersedeForm((p) => ({ ...p, title: e.target.value }))
                       }
@@ -2831,8 +3184,10 @@ export function HydraScopeCockpit() {
                     Effective Date (ISO YYYY-MM-DD)
                     <input
                       type="text"
+                      pattern="\d{4}-\d{2}-\d{2}"
                       className="hs-input"
                       value={supersedeForm.effectiveAt}
+                      disabled={activeDecisions.length === 0}
                       onChange={(e) =>
                         setSupersedeForm((p) => ({ ...p, effectiveAt: e.target.value }))
                       }
@@ -2847,6 +3202,7 @@ export function HydraScopeCockpit() {
                     type="text"
                     className="hs-input"
                     value={supersedeForm.governsInput}
+                    disabled={activeDecisions.length === 0}
                     onChange={(e) =>
                       setSupersedeForm((p) => ({ ...p, governsInput: e.target.value }))
                     }
@@ -2858,6 +3214,7 @@ export function HydraScopeCockpit() {
                   <textarea
                     className="hs-textarea"
                     value={supersedeForm.content}
+                    disabled={activeDecisions.length === 0}
                     onChange={(e) =>
                       setSupersedeForm((p) => ({ ...p, content: e.target.value }))
                     }
@@ -2869,7 +3226,7 @@ export function HydraScopeCockpit() {
                   <button
                     type="submit"
                     className="hs-btn hs-btn-primary"
-                    disabled={supersedeLoading}
+                    disabled={supersedeLoading || activeDecisions.length === 0}
                   >
                     {supersedeLoading
                       ? 'Writing :SUPERSEDES to HydraDB...'
@@ -2998,7 +3355,10 @@ export function HydraScopeCockpit() {
                     type="button"
                     className="hs-btn"
                     disabled={ingestLoading}
-                    onClick={() => handleIngestDirectory('')}
+                    onClick={() => {
+                      setIngestDirInput('.');
+                      handleIngestDirectory('reset');
+                    }}
                     title="Reload default 18-artifact FinTech evaluation workspace"
                   >
                     Reset FinTech Workspace

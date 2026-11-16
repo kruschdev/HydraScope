@@ -5,6 +5,7 @@ import { embedBatch } from '@krusch/toolkit/embeddings';
 import { config } from '../src/config.js';
 import { FINTECH_BENCHMARK_CORPUS, BENCHMARK_SCENARIOS } from '../src/corpus/fintech-fixture.js';
 import { compileArtifactsToGraph, compileDirectoryToGraph } from '../src/engines/repo-compiler.js';
+import { formatNodeChunkText } from '../src/engines/vector-benchmark.js';
 import { createHydraScopeRuntime } from '../src/runtime.js';
 
 const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -20,10 +21,10 @@ const selfSrcCompiled = compileDirectoryToGraph(path.join(ROOT_DIR, 'src'), { wo
 const selfSrcGraph = selfSrcCompiled.ok ? selfSrcCompiled.data : fintechGraph;
 
 let fintechVectors1024 = null;
-const queryVectors1024 = {};
+const queryVectors1024 = Object.create(null);
 
 try {
-    const texts = fintechGraph.nodes.map((n) => `${n.title}\n${n.path || ''}\n${n.content || ''}`);
+    const texts = fintechGraph.nodes.map((n) => formatNodeChunkText(n));
     const vecs = await embedBatch(texts, {
         host: config.ollamaEmbedHost,
         model: config.embedModel,

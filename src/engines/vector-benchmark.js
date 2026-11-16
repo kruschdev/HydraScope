@@ -120,7 +120,7 @@ export function buildLexicalDenseVector(text, dims = FALLBACK_DIMS) {
  * @param {object} node
  * @returns {string}
  */
-function formatNodeChunkText(node) {
+export function formatNodeChunkText(node) {
     const parts = [];
     if (node.title) parts.push(String(node.title));
     if (node.path) parts.push(`File: ${node.path}`);

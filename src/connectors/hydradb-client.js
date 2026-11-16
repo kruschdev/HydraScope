@@ -8,33 +8,14 @@
 import crypto from 'node:crypto';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { safeFetch } from '@krusch/toolkit/security';
+import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveStrings } from '../utils/scrubber.js';
+
+export { scrubSensitiveStrings };
 
 const TOOL_NAME = 'hydrascope.hydradb';
 const SAFE_EDGE_TYPE_RE = /^[A-Z][A-Z0-9_]{1,31}$/;
-const FORBIDDEN_OBJECT_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
-const SENSITIVE_FIELD_NAME_RE = /^(?:authorization|token|access_token|accesstoken|api_key|apikey|secret|password|bearer)$/i;
 const DEFAULT_SYNC_CONCURRENCY = 8;
 const MAX_TRAVERSAL_TARGETS = 24;
-
-// Matches RFC1918, loopback (127.0.0.0/8, 0.0.0.0), link-local (169.254.0.0/16), and Tailscale CGNAT (100.64.0.0/10).
-const INTERNAL_HOST_TOKEN =
-    '(?:localhost|\\[::1\\]|127(?:\\.\\d{1,3}){3}|0\\.0\\.0\\.0|10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2}|169\\.254(?:\\.\\d{1,3}){2}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2})';
-
-const INTERNAL_URL_RE = new RegExp(
-    `https?:\\/\\/${INTERNAL_HOST_TOKEN}(?::\\d{1,5})?(?:\\/[^\\s"'<>\\])]*)?`,
-    'gi'
-);
-const INTERNAL_HOST_PORT_RE = new RegExp(
-    `(?:\\b(?:localhost|127(?:\\.\\d{1,3}){3}|0\\.0\\.0\\.0|10(?:\\.\\d{1,3}){3}|192\\.168(?:\\.\\d{1,3}){2}|172\\.(?:1[6-9]|2\\d|3[01])(?:\\.\\d{1,3}){2}|169\\.254(?:\\.\\d{1,3}){2}|100\\.(?:6[4-9]|[7-9]\\d|1[01]\\d|12[0-7])(?:\\.\\d{1,3}){2})(?::\\d{1,5})?\\b|\\[::1\\](?::\\d{1,5})?)`,
-    'gi'
-);
-
-const BEARER_SECRET_RE = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
-const PREFIXED_TOKEN_RE =
-    /\b(?:hdb_[A-Za-z0-9_-]{4,}|sk_[A-Za-z0-9_-]{4,}|sk-[A-Za-z0-9_-]{6,}|ghp_[A-Za-z0-9]{8,}|xox[baprs]-[A-Za-z0-9-]{8,})\b/g;
-const URL_CREDENTIALS_RE = /\b(https?:\/\/)([^/\s:@]+):([^/\s@]+)@/gi;
-const LOCAL_USER_PATH_RE = /\/(?:home|Users)\/[A-Za-z0-9._-]+(?:\/[^\s"'<>:;,)\]]*)?/g;
-const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
 
 /**
  * Map a `(namespace, logicalId)` pair deterministically to a positive 48-bit safe integer
@@ -234,72 +215,6 @@ export function decodeHydraQueryResult(payload) {
             columnCount: columns.length,
         },
     };
-}
-
-/**
- * Scrub a single string for Bearer tokens, `hdb_*`/`sk_*` secrets, embedded URL credentials,
- * RFC1918/Tailscale (`100.64..127.*`)/loopback URLs and `host:port` pairs, local user-home paths, and emails.
- *
- * @param {string} input - Raw string
- * @returns {string}
- */
-function scrubSingleString(input) {
-    return input
-        .replace(BEARER_SECRET_RE, 'Bearer [REDACTED_TOKEN]')
-        .replace(PREFIXED_TOKEN_RE, '[REDACTED_SECRET]')
-        .replace(URL_CREDENTIALS_RE, '$1[REDACTED_CREDENTIALS]@')
-        .replace(INTERNAL_URL_RE, '[REDACTED_INTERNAL_URL]')
-        .replace(INTERNAL_HOST_PORT_RE, '[REDACTED_INTERNAL_HOST]')
-        .replace(LOCAL_USER_PATH_RE, '[REDACTED_LOCAL_PATH]')
-        .replace(EMAIL_RE, '[REDACTED_EMAIL]');
-}
-
-/**
- * Recursively scrub sensitive tokens, private/Tailscale/loopback network endpoints,
- * local user-home filesystem paths, and email addresses (`INV-HS-02`).
- *
- * @param {unknown} value - Arbitrary string, array, Error, or object structure
- * @returns {unknown}
- */
-export function scrubSensitiveStrings(value) {
-    const seen = new WeakSet();
-
-    const visit = (current) => {
-        if (typeof current === 'string') {
-            return scrubSingleString(current);
-        }
-        if (current === null || current === undefined || typeof current !== 'object') {
-            return current;
-        }
-        if (seen.has(current)) {
-            return '[Circular]';
-        }
-        seen.add(current);
-
-        if (Array.isArray(current)) {
-            return current.map((item) => visit(item));
-        }
-        if (current instanceof Error) {
-            return {
-                name: scrubSingleString(String(current.name || 'Error')),
-                message: scrubSingleString(String(current.message || '')),
-            };
-        }
-
-        const out = {};
-        for (const [key, val] of Object.entries(current)) {
-            if (FORBIDDEN_OBJECT_KEYS.has(key)) continue;
-            const safeKey = scrubSingleString(key);
-            if (SENSITIVE_FIELD_NAME_RE.test(key) && typeof val === 'string' && val.trim().length > 0) {
-                out[safeKey] = '[REDACTED_SECRET]';
-            } else {
-                out[safeKey] = visit(val);
-            }
-        }
-        return out;
-    };
-
-    return visit(value);
 }
 
 /**
@@ -711,6 +626,7 @@ export function createHydraOpenCypherClient(options = {}) {
         const nodeCypher =
             'MERGE (root:WorkspaceRoot {id: 1000, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, logicalId: $logicalId, kind: $kind, title: $title, path: $path, isCurrent: $isCurrent})';
 
+        const vertexIdByLogicalId = new Map();
         const nodeOps = [];
         for (const rawNode of safeNodes) {
             if (!rawNode || typeof rawNode !== 'object') continue;
@@ -722,11 +638,12 @@ export function createHydraOpenCypherClient(options = {}) {
                 rawNode.vertexId <= 9007199254740000
                     ? rawNode.vertexId
                     : surrogateVertexId(safeNamespace, logicalId);
+            vertexIdByLogicalId.set(logicalId, vertexId);
             const kind = String(rawNode.kind ?? rawNode.type ?? rawNode.label ?? 'Artifact').trim() || 'Artifact';
             const title = String(rawNode.title ?? rawNode.name ?? logicalId).trim() || logicalId;
             const nodePath = String(rawNode.path ?? rawNode.filePath ?? logicalId).trim() || logicalId;
             const isCurrent =
-                typeof rawNode.isCurrent === 'boolean' ? rawNode.isCurrent : !Boolean(rawNode.retiredAt);
+                typeof rawNode.isCurrent === 'boolean' ? rawNode.isCurrent : !rawNode.retiredAt;
 
             nodeOps.push({
                 cypher: nodeCypher,
@@ -761,9 +678,13 @@ export function createHydraOpenCypherClient(options = {}) {
             edgeOps.push({
                 cypher: `MERGE (a:GraphNode {id: $fromId, logicalId: $fromLogicalId})-[:${safeType}]->(b:GraphNode {id: $toId, logicalId: $toLogicalId})`,
                 parameters: {
-                    fromId: surrogateVertexId(safeNamespace, fromLogicalId),
+                    fromId:
+                        vertexIdByLogicalId.get(fromLogicalId) ??
+                        surrogateVertexId(safeNamespace, fromLogicalId),
                     fromLogicalId,
-                    toId: surrogateVertexId(safeNamespace, toLogicalId),
+                    toId:
+                        vertexIdByLogicalId.get(toLogicalId) ??
+                        surrogateVertexId(safeNamespace, toLogicalId),
                     toLogicalId,
                 },
             });
@@ -1341,6 +1262,9 @@ export function createHydraOpenCypherClient(options = {}) {
     }
 
     return {
+        namespace: safeNamespace,
+        graphId: safeGraphId,
+        cellId: safeCellId,
         isConfigured,
         healthz,
         queryCypher,

@@ -31,5 +31,6 @@ export const config = Object.freeze({
     hydraAllowLan: envBool('HYDRADB_ALLOW_LAN', false),
     hydraAllowTailscale: envBool('HYDRADB_ALLOW_TAILSCALE', false),
     ollamaEmbedHost: envOr('OLLAMA_EMBED_HOST', 'http://127.0.0.1:11434', 'http://127.0.0.1:11434'),
-    embedModel: envOr('EMBED_MODEL', 'snowflake-arctic-embed2:latest', 'snowflake-arctic-embed2:latest')
+    embedModel: envOr('EMBED_MODEL', 'snowflake-arctic-embed2:latest', 'snowflake-arctic-embed2:latest'),
+    adminToken: envOr('HYDRASCOPE_ADMIN_TOKEN', '', '')
 });

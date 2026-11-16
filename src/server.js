@@ -10,13 +10,16 @@ import {
 import { sseResponse } from '@krusch/toolkit/streaming';
 import { initDb, exec, query, run, closeDb } from '@krusch/toolkit/db';
 import { createRateLimiter } from '@krusch/toolkit/security';
+import { verifyBearerToken } from '@krusch/toolkit/webhooks';
 import { setupLogging } from '@krusch/toolkit/log';
 import { config } from './config.js';
 import { createHydraScopeRuntime } from './runtime.js';
+import { MAX_QUERY_CHARS } from './utils/validation.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MODULE_DIR, '..');
 const CLIENT_DIST_DIR = path.join(PROJECT_ROOT, 'client', 'dist');
+const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#07090e"/><circle cx="18" cy="32" r="6" fill="#06b6d4"/><circle cx="44" cy="18" r="6" fill="#10b981"/><circle cx="44" cy="46" r="6" fill="#10b981"/><path d="M23 29L39 20M23 35L39 44M44 24V40" stroke="#38bdf8" stroke-width="3" stroke-linecap="round"/></svg>`;
 
@@ -32,6 +35,19 @@ const FALLBACK_HTML = `<!doctype html>
     <p>Run <code>npm run build</code> to compile the React cockpit bundle, or query <code>/api/state</code>.</p>
   </body>
 </html>`;
+
+function resolveRateLimitKey(req) {
+    const socketAddr = String(req?.socket?.remoteAddress || 'local').trim();
+    if (LOOPBACK_ADDRS.has(socketAddr)) {
+        const cfIp = String(req?.headers?.['cf-connecting-ip'] || '').trim();
+        if (cfIp) return cfIp.slice(0, 64);
+    }
+    return socketAddr.slice(0, 64) || 'local';
+}
+
+function recordBoundedEvent(label) {
+    run('INSERT INTO events (label) VALUES (?)', [String(label || 'event').slice(0, 128)]);
+}
 
 function sendStaticAsset(res, content, contentType) {
     if (!res || res.writableEnded || res.destroyed || res.headersSent) return;
@@ -71,10 +87,15 @@ function serveDistFile(res, relPath, contentType, fallbackContent = null) {
 export async function buildServer({
     dbPath = config.dbPath,
     logger = null,
+    adminToken = config.adminToken,
+    rateLimitMax = 120,
+    mutationRateLimitMax = 20,
     runtimeOptions = {}
 } = {}) {
     const activeLogger =
         logger || setupLogging(config.serviceName, { logDir: config.logDir, console: false });
+    const cleanAdminToken = String(adminToken ?? '').trim();
+
     initDb(dbPath);
     exec(`
         CREATE TABLE IF NOT EXISTS events (
@@ -85,7 +106,42 @@ export async function buildServer({
     `);
 
     const runtime = await createHydraScopeRuntime(runtimeOptions);
-    const limiter = createRateLimiter({ windowMs: 60_000, max: 120 });
+    const readLimiter = createRateLimiter({ windowMs: 60_000, max: rateLimitMax });
+    const mutationLimiter = createRateLimiter({ windowMs: 60_000, max: mutationRateLimitMax });
+
+    function enforceRateLimit(ctx, limiter, toolName) {
+        const check = limiter.consume(resolveRateLimitKey(ctx.req));
+        if (!check.allowed) {
+            if (typeof ctx.res?.setHeader === 'function' && !ctx.res.headersSent) {
+                for (const [k, v] of Object.entries(check.headers || {})) {
+                    ctx.res.setHeader(k, v);
+                }
+            }
+            ctx.sendJson(429, errorEnvelope('RATE_LIMITED', 'Too many requests.', null, toolName));
+            return false;
+        }
+        return true;
+    }
+
+    function enforceOptionalAdminBearer(ctx, toolName) {
+        if (!cleanAdminToken) return true;
+        const authRes = verifyBearerToken(ctx.req?.headers?.authorization || '', cleanAdminToken, {
+            tool: toolName
+        });
+        if (!authRes.ok) {
+            ctx.sendJson(
+                401,
+                errorEnvelope(
+                    authRes.error?.code || 'AUTH_UNAUTHORIZED',
+                    'Valid Authorization Bearer token is required for workspace mutations.',
+                    null,
+                    toolName
+                )
+            );
+            return false;
+        }
+        return true;
+    }
 
     const server = createApiServer({
         serviceName: config.serviceName,
@@ -118,42 +174,48 @@ export async function buildServer({
             'GET /api/state': async () => runtime.getState(),
 
             'POST /api/arena/compare': async (ctx) => {
-                const check = limiter.consume(ctx.req.socket?.remoteAddress || 'local');
-                if (!check.allowed) {
-                    ctx.sendJson(429, errorEnvelope('RATE_LIMITED', 'Too many requests.', null, 'hydrascope.compare'));
-                    return;
-                }
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.compare')) return;
                 const prompt = String(ctx.body?.query || '').trim();
                 if (!prompt) {
                     ctx.sendJson(400, errorEnvelope('QUERY_REQUIRED', 'Field "query" is required.', null, 'hydrascope.compare'));
                     return;
                 }
-                run('INSERT INTO events (label) VALUES (?)', [`compare:${prompt.slice(0, 64)}`]);
-                return runtime.compare({
+                if (prompt.length > MAX_QUERY_CHARS) {
+                    ctx.sendJson(
+                        400,
+                        errorEnvelope('QUERY_TOO_LONG', `Field "query" exceeds ${MAX_QUERY_CHARS} characters.`, null, 'hydrascope.compare')
+                    );
+                    return;
+                }
+                recordBoundedEvent(`compare:${prompt.slice(0, 64)}`);
+                const res = await runtime.compare({
                     query: prompt,
                     asOf: ctx.body?.asOf ? String(ctx.body.asOf).trim() : null,
-                    tokenBudget: Number(ctx.body?.tokenBudget) || 900,
-                    topK: Number(ctx.body?.topK) || 4
+                    tokenBudget: Math.min(16000, Math.max(120, Number(ctx.body?.tokenBudget) || 900)),
+                    topK: Math.min(20, Math.max(1, Number(ctx.body?.topK) || 4))
                 });
+                if (!res.ok) {
+                    ctx.sendJson(400, res);
+                    return;
+                }
+                return res;
             },
 
-            'POST /api/benchmark/run': async () => {
-                run('INSERT INTO events (label) VALUES (?)', ['benchmark:run']);
+            'POST /api/benchmark/run': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.benchmark')) return;
+                recordBoundedEvent('benchmark:run');
                 return runtime.runBenchmark();
             },
 
-            'POST /api/continual/run': async () => {
-                run('INSERT INTO events (label) VALUES (?)', ['continual:run']);
+            'POST /api/continual/run': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.continual_eval')) return;
+                recordBoundedEvent('continual:run');
                 return runtime.runContinualEval();
             },
 
             'POST /api/benchmark/load': async (ctx) => {
-                const check = limiter.consume(ctx.req.socket?.remoteAddress || 'local');
-                if (!check.allowed) {
-                    ctx.sendJson(429, errorEnvelope('RATE_LIMITED', 'Too many requests.', null, 'hydrascope.load_bench'));
-                    return;
-                }
-                run('INSERT INTO events (label) VALUES (?)', ['load:run']);
+                if (!enforceRateLimit(ctx, mutationLimiter, 'hydrascope.load_bench')) return;
+                recordBoundedEvent('load:run');
                 const res = await runtime.runLoadTest({
                     totalRequests: Number(ctx.body?.totalRequests) || 64,
                     concurrency: Number(ctx.body?.concurrency) || 8
@@ -166,6 +228,9 @@ export async function buildServer({
             },
 
             'POST /api/decisions/supersede': async (ctx) => {
+                if (!enforceRateLimit(ctx, mutationLimiter, 'hydrascope.supersede')) return;
+                if (!enforceOptionalAdminBearer(ctx, 'hydrascope.supersede')) return;
+
                 const oldId = String(ctx.body?.oldId || '').trim();
                 const newId = String(ctx.body?.newId || '').trim();
                 const title = String(ctx.body?.title || '').trim();
@@ -182,7 +247,7 @@ export async function buildServer({
                     );
                     return;
                 }
-                run('INSERT INTO events (label) VALUES (?)', [`supersede:${oldId}->${newId}`]);
+                recordBoundedEvent(`supersede:${oldId.slice(0, 48)}->${newId.slice(0, 48)}`);
                 const res = await runtime.supersedeDecision({
                     oldId,
                     newId,
@@ -199,16 +264,20 @@ export async function buildServer({
             },
 
             'POST /api/workspace/ingest-dir': async (ctx) => {
-                const targetDir = String(ctx.body?.targetDir || '').trim();
-                if (!targetDir) {
+                if (!enforceRateLimit(ctx, mutationLimiter, 'hydrascope.ingest_dir')) return;
+                if (!enforceOptionalAdminBearer(ctx, 'hydrascope.ingest_dir')) return;
+
+                if (ctx.body === null || ctx.body === undefined || typeof ctx.body !== 'object' || !Object.hasOwn(ctx.body, 'targetDir')) {
                     ctx.sendJson(
                         400,
-                        errorEnvelope('TARGET_DIR_REQUIRED', 'Field "targetDir" is required.', null, 'hydrascope.ingest_dir')
+                        errorEnvelope('TARGET_DIR_REQUIRED', 'Field "targetDir" is required (use "reset" to restore default workspace).', null, 'hydrascope.ingest_dir')
                     );
                     return;
                 }
-                run('INSERT INTO events (label) VALUES (?)', ['workspace:ingest']);
-                const res = await runtime.ingestDirectory(targetDir);
+                const rawTarget = String(ctx.body.targetDir ?? '').trim();
+                const normalizedTarget = rawTarget === '' || rawTarget === 'reset' ? 'reset' : rawTarget;
+                recordBoundedEvent(`workspace:ingest:${normalizedTarget.slice(0, 64)}`);
+                const res = await runtime.ingestDirectory(normalizedTarget);
                 if (!res.ok) {
                     ctx.sendJson(400, res);
                     return;
@@ -225,8 +294,9 @@ export async function buildServer({
             },
 
             'POST /api/stream': (ctx) => {
-                const prompt = String(ctx.body?.prompt || 'ping').trim();
-                run('INSERT INTO events (label) VALUES (?)', [prompt]);
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.stream')) return;
+                const prompt = String(ctx.body?.prompt || 'ping').trim().slice(0, 240);
+                recordBoundedEvent(`stream:${prompt.slice(0, 96)}`);
                 const sse = sseResponse(ctx.res, ctx.req);
                 if (!sse.signal.aborted) {
                     sse.sendToken(`HydraScope ready: ${prompt}`);
