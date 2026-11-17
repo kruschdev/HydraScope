@@ -339,10 +339,10 @@ function extractRelativeImports(content, filePath = '') {
                 }
             }
         }
-        const pyImportRe = /^\s*import\s+([A-Za-z_][A-Za-z0-9_.,\s]*)/gm;
+        const pyImportRe = /^[ \t]*import[ \t]+([A-Za-z_][A-Za-z0-9_., \t]*)/gm;
         while ((m = pyImportRe.exec(src)) !== null) {
             for (const part of m[1].split(',')) {
-                const modName = part.trim().split(/\s+as\s+/)[0].trim();
+                const modName = part.trim().split(/[ \t]+as[ \t]+/)[0].trim();
                 if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(modName)) {
                     specifiers.push(`py:${modName}`);
                 }
@@ -359,6 +359,10 @@ function extractRelativeImports(content, filePath = '') {
         }
         const yamlPathKeyRe = /\b(?:config_path|prompt_path|template_path|schema_path)\s*:\s*['"]?([^\s'"#]+)['"]?/g;
         while ((m = yamlPathKeyRe.exec(src)) !== null) {
+            specifiers.push(`yaml:${m[1]}`);
+        }
+        const yamlEntrypointRe = /\b(?:serve|entrypoint|script|command|main)\s*:\s*[^\r\n#]*?(?:\{[a-z_]+\}\/)?([A-Za-z0-9_./-]+\.(?:py|js|mjs|cjs|ts|sh))\b/g;
+        while ((m = yamlEntrypointRe.exec(src)) !== null) {
             specifiers.push(`yaml:${m[1]}`);
         }
         return uniqueStrings(specifiers);
@@ -645,6 +649,16 @@ export function compileArtifactsToGraph(artifacts = [], { workspaceName = 'finte
                 if (!/^[A-Z][A-Z0-9_]{1,80}$/.test(envKey)) continue;
                 if (!envKeyToNodeIds.has(envKey)) envKeyToNodeIds.set(envKey, []);
                 envKeyToNodeIds.get(envKey).push(id);
+            }
+        } else if (relPath.endsWith('.yaml') || relPath.endsWith('.yml')) {
+            const yamlEnvRe = /^[ \t]{2,}(?:-[ \t]*)?([A-Z][A-Z0-9_]{1,80})[ \t]*[:=]/gm;
+            let ym;
+            while ((ym = yamlEnvRe.exec(content)) !== null) {
+                const envKey = ym[1];
+                if (!envKeyToNodeIds.has(envKey)) envKeyToNodeIds.set(envKey, []);
+                if (!envKeyToNodeIds.get(envKey).includes(id)) {
+                    envKeyToNodeIds.get(envKey).push(id);
+                }
             }
         }
     }

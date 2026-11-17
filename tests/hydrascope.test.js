@@ -501,3 +501,30 @@ test('Polyglot repository compilation extracts symbols and structural IMPACTS ed
         fs.rmSync(tmpPoly, { recursive: true, force: true });
     }
 });
+
+test('Python bare sibling import and YAML harness manifest env/entrypoint edges compile cleanly', () => {
+    const tmpHarness = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-ple-dogfood-'));
+    try {
+        fs.writeFileSync(
+            path.join(tmpHarness, 'taskbridge.py'),
+            'class Session:\n    pass\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpHarness, 'serve.py'),
+            'import os\nimport taskbridge\n\nMAX_TASK_SEC = int(os.environ.get("MAX_TASK_SEC", "2400"))\nclass MultiStageEngineeringHarness:\n    pass\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpHarness, 'submission.yaml'),
+            'name: demo-harness\nserve: /opt/venv/bin/python {src}/serve.py\nenv:\n  MAX_TASK_SEC: "2400"\n'
+        );
+
+        const res = compileDirectoryToGraph(tmpHarness);
+        assert.equal(res.ok, true);
+        const edgeTriples = new Set(res.data.edges.map((e) => `${e.from}|${e.type}|${e.to}`));
+        assert.ok(edgeTriples.has('file:taskbridge.py|IMPACTS|file:serve.py'));
+        assert.ok(edgeTriples.has('file:serve.py|IMPACTS|file:submission.yaml'));
+        assert.ok(edgeTriples.has('file:serve.py|READS_ENV|file:submission.yaml'));
+    } finally {
+        fs.rmSync(tmpHarness, { recursive: true, force: true });
+    }
+});
