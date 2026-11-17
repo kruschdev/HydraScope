@@ -65,6 +65,15 @@ Workload: `8` MCP servers (`stripe`, `ledger`, `redis`, `pagerduty`, `vault`, `p
 
 ---
 
+## Dogfooding `@hydradb/selfgraph` (`HydraDBStore` + `KuzuStore`) in My Stack
+
+Alongside direct `hydradb:0.4.0` OpenCypher execution, HydraScope natively integrates [`@hydradb/selfgraph`](./src/connectors/selfgraph-store.js) (`hydra-db/selfgraph`) so my daily IDE MCP server (`hydrascope-mcp`) and homelab personal assistant (`krusch-companion`) share the same typed bi-temporal knowledge-graph primitives:
+- **Dual Store Support (`HydraDBStore` over Bolt + Embedded `KuzuStore`)**: Connects to self-hosted `hydradb:0.4.0` over Bolt (`HYDRADB_BOLT_URI=bolt://127.0.0.1:7687`) via `HydraDBStore` and falls back out-of-the-box to embedded `KuzuStore` for zero-daemon local CLI and MCP sessions.
+- **Personalized PageRank (`strategy: "ppr"`) & Cardinality Supersession (`max_count: 1`)**: Compiles `Skill`, `McpTool`, `CodeSymbol`, `AdrRule`, and `ResolvedEntity` nodes into `HYDRASCOPE_SELFGRAPH_SCHEMA` with `contradiction: "supersede"` (`max_count: 1` on `ACTIVE_RULE_FOR` and `RESOLVED_TO`), `asOf` / `knownAt` time-travel replay, `readiness()` lint diagnostics, and known-time `graph.diff(since, until)` windows.
+- **CLI, HTTP, and MCP Access**: Run `npm run selfgraph -- "Update partner fee rounding in calculatePartnerFee"`, query `GET /api/selfgraph/status` or `POST /api/selfgraph/retrieve`, or pass `engine: "selfgraph"` to `hydrascope_traverse_context` over stdio MCP. While integrating SelfGraph into my stack, I also contributed `9` upstream bugfix PRs (`#149`, `#156`, `#157`, `#167`, `#179`, `#180`, `#208`, `#215`, and `#243`) back to `hydra-db/selfgraph`.
+
+---
+
 ## Real HydraDB `v0.4.0` Engineering Details
 
 HydraScope talks directly to the open-source `ghcr.io/hydra-db/hydradb:0.4.0` HTTP OpenCypher query engine (`POST /v1/graphs/{graph_id}/query` with `X-Graph-Namespace` and `Authorization: Bearer`) in [`src/connectors/hydradb-client.js`](./src/connectors/hydradb-client.js):

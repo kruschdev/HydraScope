@@ -23,12 +23,15 @@
     "bench": "node bin/hydrascope.js bench",
     "continual": "node bin/hydrascope.js continual",
     "load": "node bin/hydrascope.js load",
+    "selfgraph": "node bin/hydrascope.js selfgraph",
     "client:dev": "npm --prefix client run dev",
     "client:build": "npm --prefix client run build",
     "build": "npm --prefix client run build",
     "test": "NODE_ENV=test node --test tests/*.test.js"
   },
   "dependencies": {
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b8bc7506bc4cf5c9ccb2a7ae76ae171e98ce99ad.tar.gz"
+    "@hydradb/selfgraph": "file:vendor/hydradb-selfgraph-0.2.1.tgz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b8bc7506bc4cf5c9ccb2a7ae76ae171e98ce99ad.tar.gz",
+    "kuzu": "^0.11.3"
   }
 }

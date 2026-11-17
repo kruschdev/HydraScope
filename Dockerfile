@@ -11,6 +11,7 @@ ENV NODE_ENV=production
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 WORKDIR /app
 COPY package.json package-lock.json ./
+COPY vendor ./vendor
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 COPY bin ./bin
 COPY src ./src

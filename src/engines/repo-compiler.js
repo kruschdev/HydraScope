@@ -10,6 +10,13 @@ import path from 'node:path';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveText } from '../utils/scrubber.js';
 
+let toolkitTreeSitter = null;
+try {
+    toolkitTreeSitter = await import('@krusch/toolkit/treesitter');
+} catch {
+    toolkitTreeSitter = null;
+}
+
 const TOOL_NAME = 'hydrascope.compile_dir';
 const MAX_FILE_BYTES = 131072; // 128 KiB
 
@@ -30,7 +37,24 @@ const SKIPPED_DIRS = new Set([
     'data',
 ]);
 
-const CODE_EXTENSIONS = new Set(['.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.py', '.yaml', '.yml']);
+const CODE_EXTENSIONS = new Set([
+    '.js',
+    '.mjs',
+    '.cjs',
+    '.ts',
+    '.tsx',
+    '.jsx',
+    '.py',
+    '.php',
+    '.java',
+    '.cs',
+    '.go',
+    '.rb',
+    '.rs',
+    '.kt',
+    '.yaml',
+    '.yml',
+]);
 const MARKDOWN_EXTENSIONS = new Set(['.md', '.mdx']);
 const ENV_TEMPLATE_NAMES = new Set(['.env.example', '.env.sample', '.env.template']);
 const SKIPPED_FILENAMES = new Set(['pnpm-lock.yaml', 'yarn.lock', 'docker-compose.override.yml']);
@@ -136,7 +160,21 @@ function splitIdentifierTokens(raw) {
 function extractCodeSymbols(content, filePath = '') {
     const src = String(content || '');
     const symbols = [];
-    const isPython = filePath.endsWith('.py');
+    const ext = path.posix.extname(String(filePath || '')).toLowerCase();
+
+    if (toolkitTreeSitter?.isTreeSitterReady?.()) {
+        const tsRes = toolkitTreeSitter.analyzeFileWithTreeSitter(src, filePath);
+        if (tsRes?.ok && tsRes.data?.supported) {
+            for (const sym of tsRes.data.symbols || []) {
+                const name = String(sym.symbol_name || '').trim();
+                if (name && (!filePath.endsWith('.py') || !name.startsWith('_'))) {
+                    symbols.push(name);
+                }
+            }
+        }
+    }
+
+    const isPython = ext === '.py';
 
     if (isPython) {
         const pySymRe = /^(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b/gm;
@@ -149,7 +187,7 @@ function extractCodeSymbols(content, filePath = '') {
         return uniqueStrings(symbols);
     }
 
-    if (filePath.endsWith('.yaml') || filePath.endsWith('.yml')) {
+    if (ext === '.yaml' || ext === '.yml') {
         const yamlNameRe = /^name\s*:\s*['"]?([A-Za-z_][\w-]*)['"]?\s*$/gm;
         let m;
         while ((m = yamlNameRe.exec(src)) !== null) {
@@ -157,6 +195,43 @@ function extractCodeSymbols(content, filePath = '') {
         }
         const yamlTopKeyRe = /^([A-Za-z_][\w-]*)\s*:/gm;
         while ((m = yamlTopKeyRe.exec(src)) !== null) {
+            symbols.push(m[1]);
+        }
+        return uniqueStrings(symbols);
+    }
+
+    if (ext === '.go') {
+        for (const m of src.matchAll(/\bfunc\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\(/g)) {
+            symbols.push(m[1]);
+        }
+        for (const m of src.matchAll(/\btype\s+([A-Za-z_]\w*)\s+(?:struct|interface)\b/g)) {
+            symbols.push(m[1]);
+        }
+        return uniqueStrings(symbols);
+    }
+
+    if (ext === '.rs') {
+        for (const m of src.matchAll(/\b(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\b/g)) {
+            symbols.push(m[1]);
+        }
+        for (const m of src.matchAll(/\b(?:pub(?:\([^)]+\))?\s+)?(?:struct|enum|trait|mod)\s+([A-Za-z_]\w*)\b/g)) {
+            symbols.push(m[1]);
+        }
+        return uniqueStrings(symbols);
+    }
+
+    if (ext === '.java' || ext === '.cs' || ext === '.kt' || ext === '.php') {
+        for (const m of src.matchAll(/\b(?:class|interface|enum|record|struct|trait|object)\s+([A-Za-z_]\w*)\b/g)) {
+            symbols.push(m[1]);
+        }
+        for (const m of src.matchAll(/\b(?:function|fun)\s+([A-Za-z_]\w*)\s*\(/g)) {
+            symbols.push(m[1]);
+        }
+        return uniqueStrings(symbols);
+    }
+
+    if (ext === '.rb') {
+        for (const m of src.matchAll(/^\s*(?:class|module|def)\s+(?:self\.)?([A-Za-z_][\w?!]*)/gm)) {
             symbols.push(m[1]);
         }
         return uniqueStrings(symbols);
@@ -204,7 +279,42 @@ function extractCodeSymbols(content, filePath = '') {
 function extractRelativeImports(content, filePath = '') {
     const src = String(content || '');
     const specifiers = [];
-    const isPython = filePath.endsWith('.py');
+    const ext = path.posix.extname(String(filePath || '')).toLowerCase();
+    const isPython = ext === '.py';
+
+    if (toolkitTreeSitter?.isTreeSitterReady?.()) {
+        const tsRes = toolkitTreeSitter.analyzeFileWithTreeSitter(src, filePath);
+        if (tsRes?.ok && tsRes.data?.supported) {
+            for (const imp of tsRes.data.imports || []) {
+                const rawSpec = String(imp.specifier || '').trim();
+                if (!rawSpec) continue;
+                if (isPython) {
+                    if (rawSpec.startsWith('.')) {
+                        const dotMatch = /^(\.+)(.*)$/.exec(rawSpec);
+                        if (dotMatch) {
+                            const dots = dotMatch[1].length;
+                            const modTail = dotMatch[2].replace(/\./g, '/');
+                            const upPrefix = dots === 1 ? './' : '../'.repeat(dots - 1);
+                            specifiers.push(`${upPrefix}${modTail}`);
+                        }
+                    } else {
+                        specifiers.push(`py:${rawSpec}`);
+                        for (const sub of imp.importedNames || []) {
+                            if (/^[A-Za-z_]\w*$/.test(sub)) {
+                                specifiers.push(`py:${rawSpec}.${sub}`);
+                            }
+                        }
+                    }
+                } else if (ext === '.php' || ext === '.rb') {
+                    specifiers.push(`poly:${rawSpec}`);
+                } else if (ext === '.rs' && imp.kind === 'mod') {
+                    specifiers.push(`rsmod:${rawSpec}`);
+                } else if (rawSpec.startsWith('./') || rawSpec.startsWith('../')) {
+                    specifiers.push(rawSpec);
+                }
+            }
+        }
+    }
 
     if (isPython) {
         const pyFromRe = /^\s*from\s+(\.+[A-Za-z0-9_.]*)\s+import\b/gm;
@@ -241,7 +351,7 @@ function extractRelativeImports(content, filePath = '') {
         return uniqueStrings(specifiers);
     }
 
-    if (filePath.endsWith('.yaml') || filePath.endsWith('.yml')) {
+    if (ext === '.yaml' || ext === '.yml') {
         const yamlIncludeRe = /!include\s+['"]?([^\s'"#]+)['"]?/g;
         let m;
         while ((m = yamlIncludeRe.exec(src)) !== null) {
@@ -250,6 +360,27 @@ function extractRelativeImports(content, filePath = '') {
         const yamlPathKeyRe = /\b(?:config_path|prompt_path|template_path|schema_path)\s*:\s*['"]?([^\s'"#]+)['"]?/g;
         while ((m = yamlPathKeyRe.exec(src)) !== null) {
             specifiers.push(`yaml:${m[1]}`);
+        }
+        return uniqueStrings(specifiers);
+    }
+
+    if (ext === '.php') {
+        for (const m of src.matchAll(/\b(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+\.php)['"]/gi)) {
+            specifiers.push(`poly:${m[1]}`);
+        }
+        return uniqueStrings(specifiers);
+    }
+
+    if (ext === '.rb') {
+        for (const m of src.matchAll(/\brequire_relative\s*\(?\s*['"]([^'"]+)['"]/g)) {
+            specifiers.push(`poly:${m[1]}`);
+        }
+        return uniqueStrings(specifiers);
+    }
+
+    if (ext === '.rs') {
+        for (const m of src.matchAll(/^\s*(?:pub\s+)?mod\s+([A-Za-z_]\w*)\s*;/gm)) {
+            specifiers.push(`rsmod:${m[1]}`);
         }
         return uniqueStrings(specifiers);
     }
@@ -363,6 +494,40 @@ function resolveImportedCodeNode(importerPath, specifier, codeByPath, nodeByPath
         ];
         for (const candidate of yamlCandidates) {
             const hit = nodeByPath.get(candidate) || codeByPath.get(candidate);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    if (cleanSpec.startsWith('poly:')) {
+        const relRef = cleanSpec.slice(5).replace(/^\.\//, '').replace(/^\/+/, '');
+        if (!relRef) return null;
+        const polyCandidates = [
+            path.posix.normalize(path.posix.join(baseDir, relRef)),
+            path.posix.normalize(path.posix.join(baseDir, `${relRef}.rb`)),
+            path.posix.normalize(path.posix.join(baseDir, `${relRef}.php`)),
+            path.posix.normalize(relRef),
+            path.posix.normalize(`${relRef}.rb`),
+            path.posix.normalize(`${relRef}.php`),
+        ];
+        for (const candidate of polyCandidates) {
+            const hit = codeByPath.get(candidate);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    if (cleanSpec.startsWith('rsmod:')) {
+        const modName = cleanSpec.slice(6).trim();
+        if (!modName) return null;
+        const rsCandidates = [
+            path.posix.normalize(path.posix.join(baseDir, `${modName}.rs`)),
+            path.posix.normalize(path.posix.join(baseDir, modName, 'mod.rs')),
+            `src/${modName}.rs`,
+            `src/${modName}/mod.rs`,
+        ];
+        for (const candidate of rsCandidates) {
+            const hit = codeByPath.get(candidate);
             if (hit) return hit;
         }
         return null;

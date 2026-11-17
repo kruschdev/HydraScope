@@ -30,6 +30,9 @@ export const config = Object.freeze({
     hydraNamespace: envOr('HYDRADB_NAMESPACE', 'default', 'default'),
     hydraAllowLan: envBool('HYDRADB_ALLOW_LAN', false),
     hydraAllowTailscale: envBool('HYDRADB_ALLOW_TAILSCALE', false),
+    hydraBoltUri: envOr('HYDRADB_BOLT_URI', '', ''),
+    selfGraphBackend: envOr('SELFGRAPH_BACKEND', '', ''),
+    selfGraphKuzuPath: envOr('SELFGRAPH_KUZU_PATH', '', ''),
     ollamaEmbedHost: envOr('OLLAMA_EMBED_HOST', 'http://127.0.0.1:11434', 'http://127.0.0.1:11434'),
     embedModel: envOr('EMBED_MODEL', 'snowflake-arctic-embed2:latest', 'snowflake-arctic-embed2:latest'),
     adminToken: envOr('HYDRASCOPE_ADMIN_TOKEN', '', '')

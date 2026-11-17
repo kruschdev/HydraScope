@@ -159,7 +159,8 @@ export async function buildServer({
                 workspace: state.data.workspaceName,
                 nodes: state.data.nodeCount,
                 edges: state.data.edgeCount,
-                hydraMode: state.data.hydraHealth.mode
+                hydraMode: state.data.hydraHealth.mode,
+                selfGraphEngine: '@hydradb/selfgraph@0.2.1'
             };
         },
         routes: {
@@ -295,6 +296,54 @@ export async function buildServer({
                 });
             },
 
+            'GET /api/selfgraph/status': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.selfgraph_status')) return;
+                recordBoundedEvent('selfgraph:status');
+                return runtime.selfGraphStatus();
+            },
+
+            'POST /api/selfgraph/retrieve': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.selfgraph_retrieve')) return;
+                const prompt = String(ctx.body?.query || '').trim();
+                if (!prompt) {
+                    ctx.sendJson(400, errorEnvelope('QUERY_REQUIRED', 'Field "query" is required.', null, 'hydrascope.selfgraph_retrieve'));
+                    return;
+                }
+                recordBoundedEvent(`selfgraph:retrieve:${prompt.slice(0, 48)}`);
+                const res = await runtime.selfGraphRetrieve({
+                    query: prompt,
+                    asOf: ctx.body?.asOf ? String(ctx.body.asOf).trim() : null,
+                    knownAt: ctx.body?.knownAt ? String(ctx.body.knownAt).trim() : null,
+                    budgetTokens: Math.min(16000, Math.max(120, Number(ctx.body?.budgetTokens) || 900)),
+                    depth: Math.min(5, Math.max(1, Number(ctx.body?.depth) || 3)),
+                    strategy: ctx.body?.strategy ? String(ctx.body.strategy).trim() : 'ppr'
+                });
+                if (!res.ok) {
+                    ctx.sendJson(400, res);
+                    return;
+                }
+                return res;
+            },
+
+            'POST /api/selfgraph/diff': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.selfgraph_diff')) return;
+                const since = String(ctx.body?.since || '').trim();
+                if (!since) {
+                    ctx.sendJson(400, errorEnvelope('SINCE_REQUIRED', 'Field "since" (ISO 8601) is required.', null, 'hydrascope.selfgraph_diff'));
+                    return;
+                }
+                recordBoundedEvent(`selfgraph:diff:${since.slice(0, 32)}`);
+                const res = await runtime.selfGraphDiff({
+                    since,
+                    until: ctx.body?.until ? String(ctx.body.until).trim() : null
+                });
+                if (!res.ok) {
+                    ctx.sendJson(400, res);
+                    return;
+                }
+                return res;
+            },
+
             'POST /api/stream': (ctx) => {
                 if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.stream')) return;
                 const prompt = String(ctx.body?.prompt || 'ping').trim().slice(0, 240);
@@ -308,7 +357,14 @@ export async function buildServer({
         }
     });
 
-    return { server, runtime, close: () => closeDb() };
+    return {
+        server,
+        runtime,
+        close: async () => {
+            await runtime.closeSelfGraph();
+            closeDb();
+        }
+    };
 }
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);

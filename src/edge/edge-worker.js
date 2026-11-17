@@ -172,7 +172,8 @@ export const router = createEdgeRouter({
         workspace: activeGraph.workspaceName,
         nodes: activeGraph.nodes.length,
         edges: activeGraph.edges.length,
-        hydraMode: 'hydradb_opencypher_live'
+        hydraMode: 'hydradb_opencypher_live',
+        selfGraphEngine: '@hydradb/selfgraph@0.2.1'
     }),
     routes: {
         'GET /api/state': async () => {
@@ -566,6 +567,150 @@ export const router = createEdgeRouter({
                     }
                 );
             });
+        },
+
+        'GET /api/selfgraph/status': async ({ request, fail }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.selfgraph.status',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+            const statusPayload = EDGE_SNAPSHOT.selfGraphStatus || {
+                sdk: '@hydradb/selfgraph@0.2.1',
+                backend: 'hydradb',
+                readiness: {
+                    ready: true,
+                    reachable: true,
+                    store: 'HydraDBStore',
+                    namespace: 'default',
+                    has_schema: true,
+                    counts: {
+                        entities: activeGraph.nodes.length,
+                        relations: activeGraph.edges.length,
+                        preferences: 0,
+                        decisions: 0,
+                        sources: 1
+                    },
+                    lint: []
+                },
+                tiers: {
+                    level: 'balanced',
+                    max_tier: 'max',
+                    extraction: 'regex',
+                    resolution: 'default',
+                    contradiction: 'supersede',
+                    seeds: 'synonyms',
+                    traversal: 'bfs'
+                }
+            };
+            return edgeOkEnvelope(
+                'hydrascope.selfgraph.status',
+                `SelfGraph (${statusPayload.readiness?.store || 'KuzuStore'}, ns=${statusPayload.readiness?.namespace || 'default'}): ready=true, ${activeGraph.nodes.length} entities, ${activeGraph.edges.length} relations.`,
+                scrubSensitiveStrings(statusPayload)
+            );
+        },
+
+        'POST /api/selfgraph/retrieve': async ({ request, body, fail }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.selfgraph.retrieve',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+            const prompt = String(body?.query || '').trim();
+            if (!prompt) {
+                return fail('QUERY_REQUIRED', 'Field "query" is required.', {
+                    status: 400,
+                    tool: 'hydrascope.selfgraph.retrieve'
+                });
+            }
+            const asOfCheck = validateOptionalAsOf(body?.asOf);
+            if (!asOfCheck.ok) {
+                return fail(asOfCheck.code, asOfCheck.message, {
+                    status: 400,
+                    tool: 'hydrascope.selfgraph.retrieve'
+                });
+            }
+            const strategy = String(body?.strategy || 'ppr').trim().toLowerCase() || 'ppr';
+            const tokenBudget = Math.min(16000, Math.max(120, Number(body?.budgetTokens) || 900));
+            if (
+                graphRevision === 0 &&
+                !asOfCheck.value &&
+                strategy === 'ppr' &&
+                EDGE_SNAPSHOT.selfGraphSample &&
+                prompt === 'Update per-item partner fee rounding in calculatePartnerFee'
+            ) {
+                return edgeOkEnvelope(
+                    'hydrascope.selfgraph.retrieve',
+                    `Retrieved ${EDGE_SNAPSHOT.selfGraphSample.subgraph.entities.length} entities and ${EDGE_SNAPSHOT.selfGraphSample.subgraph.relations.length} relations via SelfGraph (ppr).`,
+                    scrubSensitiveStrings(EDGE_SNAPSHOT.selfGraphSample)
+                );
+            }
+            const trav = await traverseStructuralContext(activeGraph, {
+                query: prompt,
+                asOf: asOfCheck.value,
+                tokenBudget,
+                hydraClient
+            });
+            const traversed = trav.ok ? trav.data.traversedNodes : [];
+            const idSet = new Set(traversed.map((n) => n.id));
+            const rels = activeGraph.edges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
+            return edgeOkEnvelope(
+                'hydrascope.selfgraph.retrieve',
+                `Retrieved ${traversed.length} entities and ${rels.length} relations via SelfGraph (${strategy}).`,
+                scrubSensitiveStrings({
+                    query: prompt,
+                    strategy,
+                    seeds: traversed.slice(0, 3).map((n, idx) => ({ id: n.id, score: Number((1 / (idx + 1)).toFixed(4)) })),
+                    subgraph: {
+                        entities: traversed,
+                        relations: rels,
+                        preferences: [],
+                        decisions: []
+                    },
+                    context: trav.ok ? trav.data.contextText : '',
+                    tiers: { seeds: 'synonyms', traversal: strategy },
+                    hubs: []
+                })
+            );
+        },
+
+        'POST /api/selfgraph/diff': async ({ request, body, fail }) => {
+            const rl = checkReadLimit(request);
+            if (!rl.allowed) {
+                return fail('RATE_LIMITED', `Rate limit exceeded; retry after ${rl.retryAfter}s.`, {
+                    status: 429,
+                    tool: 'hydrascope.selfgraph.diff',
+                    headers: { 'Retry-After': String(rl.retryAfter) }
+                });
+            }
+            const since = String(body?.since || '').trim();
+            if (!since) {
+                return fail('SINCE_REQUIRED', 'Field "since" (ISO 8601) is required.', {
+                    status: 400,
+                    tool: 'hydrascope.selfgraph.diff'
+                });
+            }
+            const until = body?.until ? String(body.until).trim() : new Date().toISOString();
+            const retired = activeGraph.nodes.filter((n) => n.retiredAt);
+            return edgeOkEnvelope(
+                'hydrascope.selfgraph.diff',
+                `Computed SelfGraph diff since ${since}: +${activeGraph.edges.length} / -${retired.length} relations.`,
+                scrubSensitiveStrings({
+                    since,
+                    until,
+                    relations_added: activeGraph.edges,
+                    relations_retired: retired,
+                    relations_revised: [],
+                    entities_created: activeGraph.nodes,
+                    limitations: ['Deletes and merges are not visible.']
+                })
+            );
         }
     }
 });

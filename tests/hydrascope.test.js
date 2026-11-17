@@ -468,3 +468,36 @@ test('Python src-layout intra-repo imports and ADK YAML !include / config_path e
         fs.rmSync(tmpPy, { recursive: true, force: true });
     }
 });
+
+test('Polyglot repository compilation extracts symbols and structural IMPACTS edges across Rust, Ruby, and PHP', () => {
+    const tmpPoly = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-polyglot-'));
+    try {
+        fs.mkdirSync(path.join(tmpPoly, 'src'), { recursive: true });
+        fs.writeFileSync(
+            path.join(tmpPoly, 'src', 'ledger.rs'),
+            'pub struct LedgerEntry { pub cents: i64 }\npub fn verify_conservation(total: i64) -> bool { total == 0 }\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpPoly, 'src', 'lib.rs'),
+            'pub mod ledger;\npub fn settle_batch() -> bool { ledger::verify_conservation(0) }\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpPoly, 'src', 'tax_policy.rb'),
+            'module TaxPolicy\n  def self.compute_tax(cents)\n    cents / 10\n  end\nend\n'
+        );
+        fs.writeFileSync(
+            path.join(tmpPoly, 'src', 'checkout.rb'),
+            "require_relative 'tax_policy'\nclass CheckoutService\n  def finalize(cents)\n    TaxPolicy.compute_tax(cents)\n  end\nend\n"
+        );
+
+        const res = compileDirectoryToGraph(tmpPoly);
+        assert.equal(res.ok, true);
+        const edgePairs = new Set(res.data.edges.map((e) => `${e.from}->${e.to}`));
+        assert.ok(edgePairs.has('file:src/ledger.rs->file:src/lib.rs'));
+        assert.ok(edgePairs.has('file:src/tax_policy.rb->file:src/checkout.rb'));
+        assert.ok(res.data.ontology.knownConcepts.includes('verify_conservation'));
+        assert.ok(res.data.ontology.knownConcepts.includes('CheckoutService'));
+    } finally {
+        fs.rmSync(tmpPoly, { recursive: true, force: true });
+    }
+});

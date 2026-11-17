@@ -55,6 +55,13 @@ const runtime = await createHydraScopeRuntime();
 const benchmarkResult = await runtime.runBenchmark();
 const continualResult = await runtime.runContinualEval();
 const loadResult = await runtime.runLoadTest({ totalRequests: 64, concurrency: 8 });
+const selfGraphStatus = await runtime.selfGraphStatus();
+const selfGraphSample = await runtime.selfGraphRetrieve({
+    query: 'Update per-item partner fee rounding in calculatePartnerFee',
+    strategy: 'ppr',
+    budgetTokens: 900
+});
+await runtime.closeSelfGraph();
 
 const snapshot = {
     capturedAt: new Date().toISOString(),
@@ -65,7 +72,9 @@ const snapshot = {
     queryVectors1024,
     benchmarkResult,
     continualResult,
-    loadResult: loadResult.ok ? loadResult : null
+    loadResult: loadResult.ok ? loadResult : null,
+    selfGraphStatus: selfGraphStatus.ok ? selfGraphStatus.data : null,
+    selfGraphSample: selfGraphSample.ok ? selfGraphSample.data : null
 };
 
 fs.writeFileSync(SNAPSHOT_PATH, JSON.stringify(snapshot));

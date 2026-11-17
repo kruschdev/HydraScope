@@ -3,6 +3,7 @@ import path from 'node:path';
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { config } from './config.js';
 import { createHydraOpenCypherClient } from './connectors/hydradb-client.js';
+import { createHydraScopeSelfGraphAdapter } from './connectors/selfgraph-store.js';
 import { FINTECH_BENCHMARK_CORPUS, BENCHMARK_SCENARIOS } from './corpus/fintech-fixture.js';
 import { compileArtifactsToGraph, compileDirectoryToGraph } from './engines/repo-compiler.js';
 import {
@@ -25,6 +26,20 @@ import { buildDynamicScenariosForGraph } from './utils/validation.js';
 export async function createHydraScopeRuntime(options = {}) {
     const preferOllama = options.preferOllama !== false;
     const projectRoot = options.projectRoot || config.projectRoot;
+
+    // Best-effort preload of optional WebAssembly Tree-sitter grammars if present in workspace.
+    try {
+        const tsMod = await import('@krusch/toolkit/treesitter');
+        await tsMod.initTreeSitterRuntime({
+            searchRoots: [
+                projectRoot,
+                path.join(projectRoot, 'projects', 'deadbolt'),
+            ].filter(Boolean),
+        });
+    } catch {
+        // Optional WASM runtime unavailable; repo-compiler falls back deterministically.
+    }
+
     const hydraClient =
         options.hydraClient ||
         createHydraOpenCypherClient({
@@ -226,6 +241,16 @@ export async function createHydraScopeRuntime(options = {}) {
                 ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
                 model: options.embedModel ?? config.embedModel
             });
+            if (selfGraphAdapter) {
+                for (const targetId of governsIds) {
+                    await selfGraphAdapter.recordActiveRule({
+                        targetLogicalId: targetId,
+                        decisionLogicalId: newId,
+                        title,
+                        effectiveAt: effectiveAt || null
+                    });
+                }
+            }
             return scrubSensitiveStrings(res);
         });
     }
@@ -367,6 +392,51 @@ export async function createHydraScopeRuntime(options = {}) {
         });
     }
 
+    let selfGraphAdapter = null;
+    let selfGraphSyncedGraph = null;
+
+    async function ensureSelfGraphAdapter() {
+        if (!selfGraphAdapter) {
+            const boltUri = options.selfGraphBoltUri ?? config.hydraBoltUri;
+            selfGraphAdapter = await createHydraScopeSelfGraphAdapter({
+                backend: options.selfGraphBackend || config.selfGraphBackend || (boltUri ? 'hydradb' : 'kuzu'),
+                kuzuPath: options.selfGraphKuzuPath || config.selfGraphKuzuPath || null,
+                boltUri: boltUri || null,
+                boltToken: options.selfGraphBoltToken ?? config.hydraToken ?? null,
+                namespace: options.hydraNamespace ?? config.hydraNamespace
+            });
+        }
+        if (selfGraphSyncedGraph !== activeGraph) {
+            await selfGraphAdapter.syncHydraScopeGraph(activeGraph);
+            selfGraphSyncedGraph = activeGraph;
+        }
+        return selfGraphAdapter;
+    }
+
+    async function selfGraphStatus() {
+        const adapter = await ensureSelfGraphAdapter();
+        return adapter.getStatus();
+    }
+
+    async function selfGraphRetrieve({ query, asOf = null, knownAt = null, budgetTokens = 900, depth = 3, strategy = 'ppr' } = {}) {
+        const adapter = await ensureSelfGraphAdapter();
+        return adapter.retrievePpr({ query, asOf, knownAt, budgetTokens, depth, strategy });
+    }
+
+    async function selfGraphDiff({ since, until = null } = {}) {
+        const adapter = await ensureSelfGraphAdapter();
+        return adapter.diffWindow({ since, until });
+    }
+
+    async function closeSelfGraph() {
+        const current = selfGraphAdapter;
+        selfGraphAdapter = null;
+        selfGraphSyncedGraph = null;
+        if (current) {
+            await current.close();
+        }
+    }
+
     return Object.freeze({
         getGraph: () => activeGraph,
         getState,
@@ -377,6 +447,10 @@ export async function createHydraScopeRuntime(options = {}) {
         runContinualEval,
         runLoadTest,
         supersedeDecision,
-        ingestDirectory
+        ingestDirectory,
+        selfGraphStatus,
+        selfGraphRetrieve,
+        selfGraphDiff,
+        closeSelfGraph
     });
 }

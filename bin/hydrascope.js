@@ -118,6 +118,34 @@ export const cli = defineCli({
                 return res;
             }
         },
+        selfgraph: {
+            summary: 'Run @hydradb/selfgraph Personalized PageRank (PPR) & asOf retrieval over compiled workspace',
+            options: {
+                'as-of': { type: 'string' },
+                strategy: { type: 'string' },
+                budget: { type: 'string' }
+            },
+            async run({ positionals, values, io }) {
+                const prompt = positionals.join(' ').trim();
+                const runtime = await createHydraScopeRuntime({ preferOllama: false });
+                try {
+                    const res = await runtime.selfGraphRetrieve({
+                        query: prompt || 'Update per-item partner fee rounding in calculatePartnerFee',
+                        asOf: values['as-of'] || null,
+                        strategy: values.strategy || 'ppr',
+                        budgetTokens: Number(values.budget) || 900
+                    });
+                    if (!values.json && res.ok) {
+                        io.stdout(res.summary);
+                        io.stdout(`Strategy: ${res.data.strategy} | Seeds: ${res.data.seeds.map((s) => s.id).join(', ') || 'none'}`);
+                        io.stdout(res.data.context || '(No matching entities)');
+                    }
+                    return res;
+                } finally {
+                    await runtime.closeSelfGraph();
+                }
+            }
+        },
         mcp: {
             summary: 'Start the HydraScope stdio MCP server',
             options: {},

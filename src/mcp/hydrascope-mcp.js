@@ -35,6 +35,13 @@ export const HYDRASCOPE_MCP_TOOLS = Object.freeze([
                     type: 'integer',
                     default: 3,
                     description: 'Maximum structural hops (1 to 4).'
+                },
+                engine: {
+                    type: 'string',
+                    enum: ['hydradb', 'selfgraph'],
+                    default: 'hydradb',
+                    description:
+                        'Traversal backend: "hydradb" (default OpenCypher structural retriever) or "selfgraph" (@hydradb/selfgraph Personalized PageRank & asOf/knownAt replay).'
                 }
             },
             required: ['query']
@@ -188,12 +195,21 @@ export function createHydraScopeMcp({ runtime, connect = false } = {}) {
                 case 'hydrascope_traverse_context': {
                     const query = String(args.query || '').trim();
                     if (!query) return errorMcpResult(name, 'INVALID_ARGUMENTS', 'query is required.');
-                    const res = await runtime.traverse({
-                        query,
-                        asOf: args.asOf ? String(args.asOf).trim() : null,
-                        tokenBudget: Number(args.tokenBudget) || 900,
-                        maxHops: Number(args.maxHops) || 3
-                    });
+                    const useSelfGraph = String(args.engine || '').trim().toLowerCase() === 'selfgraph';
+                    const res =
+                        useSelfGraph && typeof runtime.selfGraphRetrieve === 'function'
+                            ? await runtime.selfGraphRetrieve({
+                                  query,
+                                  asOf: args.asOf ? String(args.asOf).trim() : null,
+                                  budgetTokens: Number(args.tokenBudget) || 900,
+                                  depth: Number(args.maxHops) || 3
+                              })
+                            : await runtime.traverse({
+                                  query,
+                                  asOf: args.asOf ? String(args.asOf).trim() : null,
+                                  tokenBudget: Number(args.tokenBudget) || 900,
+                                  maxHops: Number(args.maxHops) || 3
+                              });
                     return res.ok
                         ? okMcpResult(name, res.summary, res.data)
                         : errorMcpResult(name, res.error?.code || 'TRAVERSE_FAILED', res.error?.message || 'Traversal failed');
