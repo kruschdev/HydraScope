@@ -1,214 +1,142 @@
-# @krusch/toolkit & `krusch_toolkit`
+# HydraScope
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-cyan.svg)](LICENSE)
-[![Node.js >= 22](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen.svg)](https://nodejs.org)
-[![Python >= 3.11](https://img.shields.io/badge/python-%3E%3D3.11-blue.svg)](https://www.python.org)
-[![Bricks: 39 Runtime + 7 Blueprints](https://img.shields.io/badge/Lego%20Bricks-39%20Runtime%20%2B%207%20Blueprints-blueviolet.svg)](#2--core-infrastructure--application-lego-bricks-v181--full-dts-typescript-coverage)
+**Live Agent Context Layer (Skills, 64 MCP Tool Definitions, Resolved Entities, and Multi-Hop AST/ADR Lineage) Built on Self-Hosted HydraDB (`v0.4.0`)**
 
-**The Unified Application Runtime Lego Suite (`@krusch/toolkit` v1.8.1 for Node.js / TypeScript / Cloudflare Workers + `krusch_toolkit` v1.6.0 for Python 3.11+).**
+[**Launch Live Demo (`https://hydrascope.krusch.dev`)**](https://hydrascope.krusch.dev) · [**Watch Loom Walkthrough (`4m 45s`)**](https://www.loom.com/share/eb71cc14722b4e47a24cd95972261b59) · [**Read Architecture Write-Up (`krusch.dev`)**](https://krusch.dev/articles/hydrascope-agent-context-on-hydradb)
 
-`@krusch/toolkit` unifies zero-boilerplate HTTP/SSE/MCP servers, DNS-rebinding-safe SSRF guards, atomic `Idempotency-Key` locks, SHA-256 hash-chained compliance audit ledgers, deny-by-default RBAC & multi-tenant IDOR guards, HMAC-signed keyset cursors, YAML 1.2 & schema validators, `node:sqlite` FTS5/RRF & `pgvector` wrappers, SQLAlchemy WAL/async pools, air-gapped Streamlit shells, multi-tier LLM cascade routing, and research-backed agentic governance bricks under a deterministic `{ ok, tool, summary, data | error }` envelope contract (`INV-LEGO-01`).
+![HydraScope 3-Tab Prompt-First UI](./docs/hydrascope-ui.jpg)
 
-> 🔗 **Companion Coding Agent Control Plane**: Pair `@krusch/toolkit` (the *Application Runtime Plane* imported inside the services you build) with **[`krusch-stack`](https://github.com/kruschdev/krusch-stack)** (the *39-tool MCP Coding Agent Control Plane* for Claude Code, Cursor, Windsurf, and Antigravity). `krusch-stack` stamps starter templates backed by `@krusch/toolkit` and audits diffs against `INV-LEGO-01..35` so agents assemble apps from verified bricks rather than hand-rolling boilerplate.
+Most agent stacks preload dozens of MCP tool schemas into every prompt window (`12,000+` tokens before Turn 1) or bolt on a flat cosine vector store that retrieves deprecated v1 tools, misses mandatory post-check tools that share zero vocabulary with the user prompt, and repeats entity-lookup round-trips on every run.
 
----
-
-## 🎬 Narrated Architecture Walkthrough — *The Golden Bricks* (`1080p`)
-
-[![Watch @krusch/toolkit: The Golden Bricks Narrated Walkthrough (02:26 · 1080p HD)](docs/assets/krusch-toolkit-video-card.jpg)](https://krusch.dev/assets/video/krusch-toolkit-golden-bricks.mp4)
-
-> ▶️ **[Stream 1080p HD Walkthrough (`02:26`, with audio)](https://krusch.dev/assets/video/krusch-toolkit-golden-bricks.mp4)** · **[Interactive Player on `krusch.dev`](https://krusch.dev/#video-toolkit)** · **[Local MP4 (`21.7 MiB`)](docs/assets/krusch-toolkit-golden-bricks.mp4)** · **[Closed Captions (`.srt`)](docs/assets/krusch-toolkit-golden-bricks.srt)**
+I built **HydraScope** on the open-source **HydraDB (`v0.4.0`)** graph engine ([`hydra-db/hydradb`](https://github.com/hydra-db/hydradb)) as a live, self-sharpening context store for AI agents. HydraScope stores an agent's **Skills**, **MCP Tool Definitions**, **Resolved Entities**, and **Code/ADR Lineage** in HydraDB, traverses only the structural subgraph each task requires, and writes newly resolved entity aliases and co-executed tool paths back into HydraDB after every run.
 
 ---
 
-## ⚡ Quick Start
+## Architecture: How HydraDB Powers the Context Layer
 
-### Node.js / TypeScript (`@krusch/toolkit` v1.8.1)
+```mermaid
+flowchart LR
+    P["Agent Task Prompt"] --> G["Pre-Flight Ontology Gate (0 LLM Tokens)"]
+    G -->|"Ungrounded subsystem"| B["Block Hallucination Trap"]
+    G -->|"Grounded"| H["HydraDB v0.4.0 OpenCypher Traversal"]
+    H --> S["Skills -> Active MCP Tools -> Mandatory Post-Checks"]
+    H --> E["Resolved Entities (:RESOLVED_TO) + 2-Hop AST & Active ADRs (:SUPERSEDES)"]
+    S & E --> C["Compact Agent Slice (~520-721 Tokens)"]
+    C --> W["Post-Run Writeback: MERGE Resolved Entities & Tool Shortcuts into HydraDB"]
+    W --> H
+```
+
+### Why Plain Vector Stores and Tool Preloading Fail Here
+1. **Zero-Lexical-Overlap Tool & Code Dependencies**: Refunding a disputed Stripe invoice (`stripe_v2_idempotent_refund`) requires running double-entry cent conservation (`ledger_verify_cent_conservation`) and appending an HMAC receipt (`audit_append_signed_receipt`). In `1024d` embedding space (`snowflake-arctic-embed2`), those mandatory post-check tools score `< 0.20` cosine similarity to `"partner invoice refund"` and are missed `100%` of the time. HydraDB walks `(Skill)-[:IMPACTS*1..2]->(McpTool)` deterministically.
+2. **Temporal Supersession Poisoning (`:SUPERSEDES`)**: Deprecated tools (`stripe_v1_legacy_charge_refund`) and retired Architecture Decision Records (`ADR-003: SHA-1 webhook check`) often share *more* surface keywords with user prompts than their v2 replacements (`ADR-014: HMAC-SHA256`), causing vector stores to inject retired rules at rank `#1`. HydraScope traverses `:SUPERSEDES` edges to block retired tools/ADRs at `HEAD` while supporting exact `asOf` historical time-travel replay.
+3. **Continual Entity & Path Compression Across Runs**: A flat vector store has no structural memory of entities resolved on prior turns (`"Acme Logistics" -> acct_partner_99281`), forcing repeated lookup tool round-trips. HydraScope persists `:RESOLVED_TO` entity nodes and compressed tool chains into HydraDB via OpenCypher `MERGE`, collapsing multi-turn fan-out chains into a single pass.
+4. **Zero-Token Pre-Flight Answerability Shield**: When asked about subsystems absent from the architecture (`Kafka`, `Kubernetes`), vector stores still return `top-k` neighbors (`cosine ~0.50`), tempting the model to fabricate configurations. HydraScope grounds domain nouns against the HydraDB ontology first and halts ungrounded traps at `0` tokens.
+
+---
+
+## Measured Benchmarks, Baselines, and Continual Learning
+
+All benchmarks are reproducible via `npm run continual`, `npm run bench`, and `npm run load` against self-hosted `ghcr.io/hydra-db/hydradb:0.4.0` and real `1024d` `snowflake-arctic-embed2` dense embeddings (with a deterministic `256d` hashed n-gram cosine fallback when running offline).
+
+### 1. Track 2 Agent Context Layer: 64 MCP Tools + Continual Learning (`Epoch 1 -> Epoch 4`)
+
+Workload: `8` MCP servers (`stripe`, `ledger`, `redis`, `pagerduty`, `vault`, `postgres`, `github`, `audit` = `64` tool schemas totaling `12,412` preload tokens) across multi-turn operational tasks with recurring organization/cluster entities and retired v1 tool traps.
+
+| Context Strategy | Tool Recall | Tool Precision | Tool F1 | Single-Turn Ready | Deprecated Tool Poison | Mean Round-Trips | Mean Prompt Tokens |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Baseline 1: Preload All 64 MCP Tools** | `100.0%` | `4.7%` | `9.0%` | `0.0%` | `100.0%` | `2.50` | `12,412` |
+| **Baseline 2: Dense `1024d` Vector Top-5** | `33.3%` | `20.0%` | `25.0%` | `0.0%` | `100.0%` | `5.00` | `1,132` |
+| **HydraScope Epoch 1 (Cold Graph)** | `100.0%` | `75.0%` | `85.7%` | `0.0%` | **`0.0%`** | `2.50` | `883` |
+| **HydraScope Epoch 2 (+Resolved Partner)** | `100.0%` | `87.5%` | `93.3%` | `50.0%` | **`0.0%`** | `1.75` | `802` |
+| **HydraScope Epoch 3 (+Resolved Cluster)** | `100.0%` | `93.8%` | `96.8%` | `75.0%` | **`0.0%`** | `1.38` | `761` |
+| **HydraScope Epoch 4 (Converged Graph)** | **`100.0%`** | **`100.0%`** | **`100.0%`** | **`100.0%`** | **`0.0%`** | **`1.00`** | **`721` (`-94.2%`)** |
+
+### 2. Multi-Hop Code AST + Temporal ADR Suite (`8` Scenarios)
+
+| Retrieval Arm | Scenario Pass Rate | Critical Multi-Hop Recall | Temporal Poisoning | Trap Block Rate | Mean Prompt Tokens |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Full-Repo Stuffing** | `50.0%` (`4/8`) | `100.0%` | `100.0%` | `0.0%` | `4,813` |
+| **Dense `1024d` Vector Top-K (`k=4`)** | `12.5%` (`1/8`) | `77.8%` | `100.0%` | `0.0%` | `1,257` |
+| **HydraScope Structural Graph (`hydradb:0.4.0`)** | **`100.0%` (`8/8`)** | **`100.0%`** | **`0.0%`** | **`100.0%`** | **`520` (`-89.2%`)** |
+
+### 3. Self-Hosted `hydradb:0.4.0` Concurrent OpenCypher Load Test
+- **Workload**: `64` concurrent mixed OpenCypher multi-hop `MATCH` traversals and 1-hop `MERGE` mutations across `8` parallel workers on `ghcr.io/hydra-db/hydradb:0.4.0`.
+- **Measured Result**: **`64 / 64` (`100%`) succeeded**, **`~409 ops/sec`**, **`P50 = 11.7ms`**, **`P95 = 40.6ms`**, **`P99 = 58.7ms`**, verified via monotonic `sgk:1:...` read-epoch bookmarks.
+
+---
+
+## How I Use HydraDB & `@hydradb/selfgraph` Across My Daily Stack
+
+Across my local multi-node Linux workstation and GPU servers, my coding agents and background SRE daemon coordinate `8` MCP servers (`40+` tools) and dozens of active repositories. Preloading every tool schema burned `10k+` tokens before Turn 1, while `1024d` cosine vector search repeatedly surfaced retired ADRs or missed mandatory 2-hop verification tools that shared zero keywords with my prompt. Running self-hosted **`hydradb:0.4.0`** together with **[`@hydradb/selfgraph`](https://github.com/hydra-db/selfgraph)** ([`src/connectors/selfgraph-store.js`](./src/connectors/selfgraph-store.js)) solved three concrete bottlenecks across my stack:
+
+1. **IDE & Fleet Coding Context (`hydrascope-mcp` on `HydraDBStore` + `KuzuStore`)**: My global IDE MCP config mounts `hydrascope-mcp` against self-hosted `hydradb:0.4.0` (supporting `HydraDBStore` over Bolt `:7687` as well as embedded `KuzuStore` for zero-daemon local CLI/worktree sessions). Personalized PageRank (`strategy: "ppr"`) walks `Skill -> McpTool -> CodeSymbol -> AdrRule` subgraphs inside a `520-750` token budget at `$0` LLM extraction cost, `contradiction: "supersede"` (`max_count: 1` on `ACTIVE_RULE_FOR` and `RESOLVED_TO`) retires outdated rules automatically on write while keeping `asOf` / `knownAt` history queryable, and `SelfGraph.readiness()` + `graph.diff(since, until)` audit orphan symbols and recent graph mutations after repository compiles.
+2. **Bi-Temporal Personal Knowledge Graph in [`krusch-companion`](https://github.com/kruschdev/krusch-companion)**: In my daily local-first personal assistant, flat SQLite notes and vector chunks struggled whenever single-valued facts changed over time (who works where, current primary contractor/vendor, current address) or when voice notes created duplicate contact mentions (`"M. Chen"` vs `"Maya Chen"`). Embedding `@hydradb/selfgraph` (`KuzuStore` alongside `companion.db`, zero extra daemon or GPU VRAM overhead) gave me automatic `max_count: 1` supersession on `WORKS_AT`, `LIVES_IN`, and `PRIMARY_VENDOR_FOR`, owner-certified ground-truth relations (`relations.certify` so background note re-ingestion never overwrites verified facts), and reversible entity merges (`entities.unmerge`).
+3. **CLI, HTTP, MCP & Upstream Contributions**: You can run `npm run selfgraph -- "Update per-item partner fee rounding in calculatePartnerFee"`, hit `GET /api/selfgraph/status` or `POST /api/selfgraph/retrieve` (live on `https://hydrascope.krusch.dev`), or pass `engine: "selfgraph"` to `hydrascope_traverse_context` over stdio MCP. Dogfooding SelfGraph against real ontologies in both repos surfaced subtle cross-SDK edge cases around multi-endpoint `max_count` supersession, schema alias canonicalization, `known_at` provenance, and explicit stopword/single-character entity terms in `check_answerable`, which I fixed and contributed back upstream across `9` PRs (`#149`, `#156`, `#157`, `#167`, `#179`, `#180`, `#208`, `#215`, and `#243`).
+
+---
+
+## Real HydraDB `v0.4.0` Engineering Details
+
+HydraScope talks directly to the open-source `ghcr.io/hydra-db/hydradb:0.4.0` HTTP OpenCypher query engine (`POST /v1/graphs/{graph_id}/query` with `X-Graph-Namespace` and `Authorization: Bearer`) in [`src/connectors/hydradb-client.js`](./src/connectors/hydradb-client.js):
+- **Collision-Free 48-Bit Integer Surrogate Keys**: Maps string logical IDs (`tool:stripe_v2_idempotent_refund`, `adr:ADR-014`) via SHA-256 to deterministic safe integers (`1000..9007199254740000`) matching HydraDB's native integer vertex ID requirement.
+- **One-Hop Directed `MERGE` Dialect Alignment**: HydraDB `v0.4.0`'s query engine executes one-hop edge patterns in `MERGE` (`MERGE (root:WorkspaceRoot {id: 1000})-[:CONTAINS]->(n:GraphNode {...})` and `MERGE (a:GraphNode)-[:IMPACTS]->(b:GraphNode)`) while stripping `null` parameter fields.
+- **Typed Cell Unwrapping & Epoch Bookmarks**: Decodes HydraDB typed row envelopes (`{"type":"string","value":...}`) and surfaces live `read_epoch` and `sgk:1:...` consistency bookmarks directly in the UI inspector.
+
+---
+
+## Go-To-Market: Who Buys HydraScope
+
+- **Target Customer**: Engineering and SRE organizations running internal coding, incident-response, or finance operations agents across `5+` MCP servers (`40-200` tools) where prompt-window bloat drives `$2k-$15k/mo` in wasted frontier token spend and deprecated tool calls cause production incidents.
+- **Bottom-Up PLG Wedge (`npx hydrascope bench`)**: Any developer can point HydraScope at a local repo in 30 seconds to quantify their exact 2-hop blind spots and token waste against vector search, then deploy self-hosted **HydraDB** (`docker compose --profile hydradb up -d`) + the **HydraScope MCP Server** (`hydrascope-mcp`) across Claude Code, Cursor, Codex, and Windsurf.
+
+---
+
+## Quick Start
 
 ```bash
-git clone https://github.com/kruschdev/toolkit.git
-cd toolkit
-PUPPETEER_SKIP_DOWNLOAD=true npm install
+cp .env.example .env
+npm install
+npm run build
 npm test
-npm run verify:zero-leaks
+npm start
 ```
 
-### Python 3.11+ (`krusch_toolkit` v1.6.0 — inside `./python`)
+Open `http://127.0.0.1:4190` to launch the 3-tab **HydraScope** UI:
+1. **`Compare`**: Prompt-first search with 4 plain-English example presets, a 3-stat verdict bar, side-by-side Vector Search vs. HydraDB Graph results, a 3-step dependency path diagram, `asOf` time-travel (`Today` vs. `2026-03-01`), and a collapsible OpenCypher + prompt inspector.
+2. **`Benchmarks`**: Unified 8-task codebase retrieval scorecard, 64-tool continual learning curve (`85.7% -> 100%` F1, `5.0 -> 1.0` round-trips, `-94.2%` tokens), and live 64-query `hydradb:0.4.0` throughput runner.
+3. **`Studio`**: Retire and replace active ADRs live in HydraDB (`:SUPERSEDES`), replay historical dates, or compile a local repository folder into the graph.
+
+### Run Self-Hosted HydraDB `v0.4.0` via Docker Compose
 
 ```bash
-pip install -e "./python[dev,fastapi,streamlit]"
-pytest python/tests -q
+docker compose --profile hydradb up -d
 ```
 
----
-
-## 🏛️ Architecture & Module Index
-
-### 1. 🤖 Agent Governance & Research Modules
-
-| Module Path | Core Exports | Research Foundation & Capabilities |
-|---|---|---|
-| `@krusch/toolkit/modular-rsi` | `createModularRsiHarness`, `RSI_MODULES`, `DEFAULT_HARNESS_SPECS` | **Modular Recursive Harness Self-Improvement** ([arXiv: 2609.14857](https://arxiv.org/abs/2609.14857)): Decomposes harnesses into 5 evolvable modules (`AgentLoop`, `ToolUse`, `ObservationManagement`, `ContextManagement`, `TaskCompletionDetection`) with contrastive failure attribution. |
-| `@krusch/toolkit/kv-cache-manager` | `calculateGvaFootprint`, `createGvaAllocator`, `createKvCacheManager`, `calculateKvCacheMetrics` | **Grouped Value Attention & Persistent Q4 KV Cache** ([arXiv: 2609.13285](https://arxiv.org/abs/2609.13285) & [arXiv: 2603.04428](https://arxiv.org/abs/2603.04428)): 45–47% KV cache footprint reduction via on-demand key projection, >7x Q4-GVA compression, and multi-GPU VRAM headroom scheduling. |
-| `@krusch/toolkit/trajectory-guard` | `evaluateMultiAgentResilience`, `createTrajectoryGuard`, `createPigEngine`, `calculateIntelligenceEntropy`, `sanitizeAgentMessage`, `checkGoalDrift` | **Emergence World & PIG Engine** ([arXiv: 2609.17320](https://arxiv.org/abs/2609.17320) & [arXiv: 2606.08162](https://arxiv.org/abs/2606.08162)): Detects error cascades, circular delegation deadlocks, credential leakage, exponential intelligence entropy ($S(t) = S_0 e^{\alpha t}$), and prompt injection propagation. |
-| `@krusch/toolkit/skiller` | `routeDiverseSkills`, `createExecutableSkillContract`, `extractSkillFromTrajectory`, `stageSkillForMonorepo` | **Diverse Skill Routing & SKILLER** ([arXiv: 2609.05824](https://arxiv.org/abs/2609.05824) & [arXiv: 2608.10538](https://arxiv.org/abs/2608.10538)): DPP-inspired diversity kernel for selecting orthogonal, non-redundant agent skills; natural-language RL skill synthesis and executable test contracts. |
-| `@krusch/toolkit/skill-state` | `createSkillStateManager`, `calculateSkillStateSavings` | **SKILL.state: Bounded Agent State** ([arXiv: 2608.26263](https://arxiv.org/abs/2608.26263)): Maintains explicit mutable state $S_t$, evicts reasoning traces post-validation, and enforces $O(1)$ prompt size bounds (up to 16x token reduction). |
-| `@krusch/toolkit/second-thought` | `createSecondThoughtEngine` | **Second Thought Parallel Auxiliary Reasoning** ([arXiv: 2608.13667](https://arxiv.org/abs/2608.13667)): Pre-synthesizes speculative success and error-recovery branches concurrently during tool I/O latency windows. |
-| `@krusch/toolkit/dhd-deliberation` | `extractTrajectoryValue`, `evaluateDHDConsensus` | **Diverse Hypothesis Deliberation & Trajectory Value** ([arXiv: 2608.14375](https://arxiv.org/abs/2608.14375) & [arXiv: 2608.25937](https://arxiv.org/abs/2608.25937)): Extracts structural invariants and failure boundaries from failed candidate runs ("Wrong but Useful"). |
-| `@krusch/toolkit/prune` | `shouldActivateMemory`, `createKnowledgeBoundaryRouter`, `prunePreRetrieval`, `prunePostRetrieval`, `prunePreSynthesis`, `createContextPruner` | **Knowledge Boundary Routing & Context Pruning** ([arXiv: 2608.23982](https://arxiv.org/abs/2608.23982) & [arXiv: 2608.08389](https://arxiv.org/abs/2608.08389)): Conditional memory retrieval gating to bypass memory on self-contained math/syntax queries; 3-stage marginal value context pruning. |
-| `@krusch/toolkit/spec-verifier` | `createSpecAuditRunner`, `runAuditPass`, `runRefereeAuditPass`, `runThreeFamilyRefereeAudit`, `evaluateRefereeConsensus`, `checkConvergence`, `synthesizeExecutableContract`, `evaluateDualTrackRefinement` | **Spec-First Verification & 3-Family Referee Consensus** ([arXiv: 2608.12440](https://arxiv.org/abs/2608.12440), [arXiv: 2608.03744](https://arxiv.org/abs/2608.03744), [arXiv: 2608.16742](https://arxiv.org/abs/2608.16742)): Dual-zero-defect convergence gate, concurrent 3-family referee re-derivation with pre-findings `"invariantChecks"`, and executable test contracts. |
-| `@krusch/toolkit/memory-invalidation` | `ArtifactVerificationGraph`, `anchorVerificationClaim`, `checkArtifactDrift`, `computeArtifactHash`, `MemoryInvalidationEngine`, `filterActiveMemories` | **EA-Graph & Temporal Fact Invalidation** ([arXiv: 2608.04278](https://arxiv.org/abs/2608.04278) & [arXiv: 2608.13606](https://arxiv.org/abs/2608.13606)): Anchors verification claims to source file SHA-256 content hashes; auto-invalidates claims on upstream code drift. |
-| `@krusch/toolkit/harness-engineering` | `HARNESS_SUBSYSTEMS`, `createFrozenPolicyFloor`, `deobfuscateShellCommand`, `validatePolicyRuleExamples`, `delimitUntrustedContent`, `evaluateTruncationPoisoningGuard`, `evaluateVerifyOnStopGuard`, `createDeferredToolBridge`, `normalizePromptCachePrefix` | **7-Subsystem Autonomous Harness Engineering** ([arXiv: 2609.00006](https://arxiv.org/abs/2609.00006)): Import-frozen policy floors (`autoApprove`/`yolo`-proof), shell deobfuscation, load-time rule self-tests, `<UNTRUSTED_CONTENT>` taint tags, `MAX_TOKENS` truncation-poisoning & verify-on-stop loop guards, Okapi BM25 deferred tool discovery, and SHA-256 KV-cache prefix normalization. |
-| `@krusch/toolkit/grounded-harness` | `SCALE_TIERS`, `resolveScaleProfile`, `buildScaleAwareDirective`, `buildSafeGeminiToolConfig`, `normalizeCodeSnippetForHash`, `inspectOutputDefects`, `detectDatasetSchemaHazards`, `formatTimeoutWithPartialStdout`, `runAsyncWithPartialStdout`, `createToolBudgetGate`, `createDeltaContextTracker` | **Turn-0 Grounded & Scale-Aware Harness Primitives** (`INV-GH-01..10`): Monotonic `SMALL_MODEL` / `MID_MODEL` / `FRONTIER_REASONING` policy, CSV `"NA"` & JSON `null`/`[]` wildcard hazard detection, Gemini tool-less `mode: "NONE"` guard, quote-safe spin-loop call hashing (`maxReadStreak = 0`), zero-turn defect-only output gate, and partial-stdout timeout recovery. |
-| `@krusch/toolkit/raw-rag` | `createRawRagIndex`, `chunkConversationWindows`, `rerankCandidateWindows`, `assembleReaderEvidence`, `auditRagBaselineConfig`, `normalizeAppendOnlyWriteOp`, `evaluateCoverageAndUtilization`, `evaluateConditionalPathRetention` | **Source-Preserving Episodic RAG & Append-Only Memory** ([arXiv: 2610.30755](https://arxiv.org/abs/2610.30755)): Zero-LLM ingestion (`256`-tok / `32`-overlap turn-linked windows), `Top-128` dense + `Top-15` cross-encoder rerank, `5,000`-token graceful turn-expansion fallback, `ADD/NONE` non-destructive write policy, and $\widehat{C}_s/\widehat{U}_s$ & $P(\text{path}\mid\text{result})$ diagnostics. |
-| `@krusch/toolkit/vld-scaling` | `VLD_PATTERNS`, `compileVldSchedule`, `calculateKnowledgeCapacityEntropy`, `verifyVldCapacityInvariance`, `estimateReasoningDepth`, `detectVldFixedPoint`, `createVldScalingEngine` | **Virtual Logical Depth (VLD) Scaling Laws** ([arXiv: 2506.18233v3](https://arxiv.org/abs/2506.18233v3)): 4th scaling dimension (`Sequence`, `Cycle`, `Inverse Cycle`, and `Late-Layer Cycle` weight reuse), $\Delta H = H_1 - H_2$ knowledge entropy measurement ($\approx 2\text{ bits/param}$), `iGSM` operational depth estimation, and fixed-point halting. |
-
----
-
-### 2. 🧰 Core Infrastructure & Application Lego Bricks (`v1.8.1` — Full `.d.ts` TypeScript Coverage)
-
-Every subpath export ships strict `.d.ts` declarations (`./types/*.d.ts`) compatible with `moduleResolution: "NodeNext"` and zero-build Node 22 TypeScript (`node --experimental-strip-types`).
-
-| Module Path | Core Exports | Description |
-|---|---|---|
-| `@krusch/toolkit/http` | `createApiServer`, `createExpressBricks`, `readBoundedJsonBody`, `okEnvelope`, `errorEnvelope`, `asyncHandler`, `attachGracefulShutdown` | Zero-boilerplate HTTP/Express server factory with `/health` & `/doctor`, CORS, `413` TCP-RST-safe body limits, `X-Request-Id` timing, and graceful shutdown. |
-| `@krusch/toolkit/streaming` | `sseResponse`, `streamChat` | `AbortController`-safe Server-Sent Events (SSE) with `X-Accel-Buffering: no`, `: ping` heartbeats, and native Ollama/LLM stream piping. |
-| `@krusch/toolkit/mcp` | `defineMcpTool`, `createMcpServer`, `okMcpResult`, `errorMcpResult`, `validateToolArgs` | Compliant Stdio MCP server brick enforcing `INV-STACK-03` 4-boolean annotations, schema arg validation, and universal JSON envelopes. |
-| `@krusch/toolkit/pg` | `createPgPool`, `runSqlMigrations`, `pgVectorSearch`, `buildPgConnectionString`, `assertSafePgIdentifier` | Retry-guarded PostgreSQL pool, transactional `schema_migrations` runner, and 1024-dim `snowflake-arctic-embed2` `<=>` cosine search. |
-| `@krusch/toolkit/sqlite` | `openSqliteDb`, `escapeFts5Query`, `fuseRrfResults`, `DatabaseSync`, `isSqliteCorruptionError` | Zero-native-addon `node:sqlite` WAL factory (`BEGIN IMMEDIATE` + nested `SAVEPOINT`), deterministic FTS5 query escaper, and Weighted Reciprocal Rank Fusion (`INV-LEGO-12`). |
-| `@krusch/toolkit/security` | `isPrivateOrReservedIp`, `validateOutboundUrl`, `safeFetch`, `createRateLimiter` | DNS-rebinding-safe outbound SSRF guard (connect-time `undici` IP check + manual redirect re-validation) and bounded memory-safe `429` rate limiter (`INV-LEGO-13`). |
-| `@krusch/toolkit/idempotency` | `createIdempotencyStore`, `withIdempotency`, `createIdempotencyMiddleware`, `computePayloadFingerprint`, `normalizeIdempotencyKey` | Atomic `Idempotency-Key` in-flight lock (`409`), SHA-256 payload-mismatch guard (`422`), fencing tokens, and tenant-scoped replay middleware (`INV-LEGO-31`). |
-| `@krusch/toolkit/audit-log` | `createAuditLog`, `verifyAuditChain`, `computeAuditEntryHash`, `canonicalizeAuditPayload`, `GENESIS_AUDIT_HASH` | Tamper-evident SHA-256 / HMAC hash-chained compliance ledger with canonical JSON serialization and SQLite `BEFORE UPDATE/DELETE` immutability triggers (`INV-LEGO-32`). |
-| `@krusch/toolkit/rbac` | `createRbacPolicy`, `evaluateAccess`, `assertTenantOwnership`, `createRbacGuard`, `matchPermissionPattern` | Zero-`node:*` deny-by-default role inheritance & scoped permission evaluator with explicit-deny precedence and OWASP A01 multi-tenant IDOR guards (`INV-LEGO-33`). |
-| `@krusch/toolkit/pagination` | `clampPageLimit`, `encodeCursor`, `decodeCursor`, `buildKeysetPage`, `paginateItems` | Constant-time HMAC-SHA256 tamper-signed base64url keyset cursor encoder/decoder with scope/TTL binding and bounded page-limit clamps (`INV-LEGO-34`). |
-| `@krusch/toolkit/schema` | `s`, `toJsonSchema`, `validateSchema`, `validatePayload`, `createSchemaMiddleware` | Zero-`node:*` composable schema builder, Zod/JSON-Schema adapter, MCP `inputSchema` compiler, and prototype-safe validation middleware (`INV-LEGO-17`). |
-| `@krusch/toolkit/yaml` | `DEFAULT_YAML_LIMITS`, `parseSafeYaml`, `stringifySafeYaml`, `validateYamlConfig`, `loadSafeYamlPack` | Zero-dependency, zero-`node:*` isomorphic YAML 1.2 Core parser/serializer with alias-bomb & tag guards, schema validation, and SHA-256 pack loading (`INV-LEGO-23`). |
-| `@krusch/toolkit/upload` | `sanitizeUploadFilename`, `sniffMimeMagic`, `verifyUploadMime`, `parseBoundedMultipart` | Stream-draining $O(N)$ `multipart/form-data` parser with pre-buffer byte ceilings, path-traversal filename sanitizer, and magic-byte MIME guard (`INV-LEGO-18`). |
-| `@krusch/toolkit/cascade` | `DEFAULT_FLEET_CASCADE_TIERS`, `createTierCircuitBreaker`, `selectCascadeTier`, `probeBurstEndpoint`, `executeWithCascadeFallback` | Zero-`node:*` `<25µs` L1–L3 cascade tier selector, single-flight `HALF_OPEN` circuit breaker, GPU burst probe, and `AbortController` fallback runner (`INV-LEGO-19`). |
-| `@krusch/toolkit/audio` | `encodeWavPcm16`, `parseWavHeader`, `transcribeWhisperAudio`, `synthesizeSpeechAudio` | Zero-`node:*` RIFF/WAVE PCM16 encoder/parser (`JUNK`/`LIST` chunk-tolerant) plus `AbortController`-bounded Whisper STT and streaming TTS clients (`INV-LEGO-20`). |
-| `@krusch/toolkit/lego-scout` | `scoutHomelabLegoCandidates`, `CANDIDATE_PATTERN_SIGNATURES`, `formatPortableProjectPath` | Cross-repository boilerplate adoption auditor and `>= 3` Rule-of-3 Anti-Bloat brick candidate scout (`INV-LEGO-15..16`). |
-| `@krusch/toolkit/react` | `cn`, `STYLES`, `useAesthetics`, `fetchApiJson`, `useApiQuery`, `useSSEStream`, `AppShell`, `StatusPill`, `MetricCard`, `StreamingChatPanel`, `ErrorBoundary` | Headless-safe React design tokens, `AbortController`-managed fetch/SSE hooks, and drop-in pure `createElement` dashboard shells. |
-| `@krusch/toolkit/edge` | `createEdgeRouter`, `edgeSseResponse`, `createEdgeKvJsonStore`, `readBoundedEdgeJson`, `edgeCorsHeaders`, `edgeOkResponse`, `edgeErrorResponse` | Zero-`node:*` Web-Standards router, `413` body guard, SSE stream, and KV store for Cloudflare Workers and edge runtimes (`INV-LEGO-08`). |
-| `@krusch/toolkit/webhooks` | `constantTimeEqual`, `signWebhookHmac`, `verifySlackSignature`, `verifyGithubSignature`, `verifyStripeSignature`, `verifyBearerToken` | Constant-time HMAC-SHA256 webhook signature verifiers (Slack, GitHub, Stripe) with replay protection and SHA-256 Bearer auth (`INV-LEGO-09`). |
-| `@krusch/toolkit/cli` | `withSingleInstanceLock`, `attachDaemonSignals`, `appendJsonlRecord`, `defineCli` | Atomic `wx` PID/nonce single-instance cron lockfile guard, daemon signal teardown, NDJSON telemetry appender, and `--json` CLI builder (`INV-LEGO-10`). |
-| `@krusch/toolkit/catalog` | `RUNTIME_BRICKS`, `PROJECT_ARCHETYPES`, `listLegoBricks`, `listArchetypes`, `auditBoilerplateText`, `scoreLegoBrickCoverage` | Zero-`node:*` machine-readable catalog of 39 runtime bricks, 7 zero-LLM project blueprints, and 16 `<1ms` Slop-Breaker detectors (`krusch-lego` CLI, `INV-LEGO-35`). |
-| `@krusch/toolkit/scaffold` | `scaffoldProject` | Deterministic `<50ms` zero-LLM blueprint stamper (`node-api-sqlite`, `node-ts-service`, `node-rag-pgvector`, `mcp-stdio-server`, `fullstack-react-vite`, `python-fastapi-service`, `cloudflare-worker`). |
-| `@krusch/toolkit/embeddings` | `embed`, `embedBatch`, `embedChunkedCentroid`, `createEmbeddings`, `formatEmbeddingInput`, `calibrateQuerySimilarity` | Asymmetric query/document 1024-dim `snowflake-arctic-embed2` embedding client with batch `/api/embed` fallback and L2 centroid pooling. |
-| `@krusch/toolkit/llm` | `chat`, `chatJson`, `resolveModelConfig`, `resolveGeminiToolConfig`, `isGemini4Model`, `normalizeThinkingLevel`, `resolveMaxOutputTokens`, `buildGeminiPayload`, `extractGeminiTextParts` | Multi-provider unified LLM client (`gemini-4-argon` & `gemini-3.8-flash` with multi-hop `CONTINUATION`, `thinkingLevel`, and automatic tool-less `functionCallingConfig: { mode: 'NONE' }`, OpenRouter, xAI Grok, Ollama, and optional [`krusch-cascade-router`](https://github.com/kruschdev/krusch-cascade-router)). |
-| `@krusch/toolkit/vision` | `callGeminiMedia`, `callGeminiMediaJson` | Multimodal `gemini-4-argon` vision/audio/PDF client supporting `mediaItems`, `thinkingLevel`, `65,536` `maxOutputTokens`, and multi-hop `CONTINUATION`. |
-| `@krusch/toolkit/decide` | `decide`, `decideBatch`, `calibrateChoiceLogprobs`, `createSystem1Decider` | Single-token logprob System 1 decision router (`max_tokens: 1`, `temperature: 0`, `logprobs: true`) with LRU cache and deterministic offline CI fallback. |
-| `@krusch/toolkit/db` | `initDb`, `getDb`, `query`, `queryOne`, `run`, `transaction`, `isSqliteCorruptionError` | Singleton SQLite WAL wrapper with compound-fault crash recovery (`INV-REC-01..05`). |
-| `@krusch/toolkit/config` | `loadProjectConfig`, `createConfig`, `envOr`, `envInt`, `envBool` | Layered configuration loader: Defaults → `config.json` → `.env` → System Environment. |
-| `@krusch/toolkit/auth` | `createAuth` | Factory-based JWT authentication middleware and `httpOnly` cookie management. |
-| `@krusch/toolkit/dbos` | `createDbosClient`, `DbosClient` | Stateful workflow queue client, blocking polls, and worker queue healing. |
-| `@krusch/toolkit/log` | `setupLogging` | Structured rotating JSON logger with standard metadata. |
-| `@krusch/toolkit/browser` | `launchBrowser`, `scrapeHtml`, `captureScreenshot`, `runInteractiveSession`, `captureResponsiveBreakpoints`, `auditPageWithArgon` | Stealth Puppeteer browser automation, `375/768/1440px` breakpoint capture, console/network telemetry, and Gemini 4 Argon visual UI auditing. |
-| `@krusch/toolkit/polygres` | `createPolygresClient`, `PolygresClient` | Dual-engine PostgreSQL client: local `pg.Pool` wire connection + Polygres Cloud 0.5.0 Runtime REST API. |
-| `@krusch/toolkit/imagen` | `createImageGenerator` | Gemini native image generation for thumbnails, slides, and promotional assets. |
-| `@krusch/toolkit/scheduler` | `createScheduler` | Safe `node-cron` task scheduler with integrated error trapping. |
-
----
-
-### 3. 🐍 Python Lego Suite (`krusch_toolkit` v1.6.0 — `./python`)
-
-All Python Lego bricks import cleanly in bare Python 3.11+ stdlib (lazy-loading optional `fastapi`, `httpx`, `streamlit`, `sqlalchemy`, or `pyyaml` only when invoked).
-
-| Python Module | Core Exports | Description |
-|---|---|---|
-| `krusch_toolkit.fastapi_app` | `create_fastapi_app`, `ok_envelope`, `error_envelope`, `sse_event_response`, `format_sse_frame` | Zero-boilerplate FastAPI factory with `/health` & `/doctor`, CORS credentials guard, `X-Request-ID`, SSE framing, and brownfield compatibility switches (`INV-LEGO-25`). |
-| `krusch_toolkit.http_client` | `request_json`, `async_request_json`, `HttpCircuitBreaker`, `create_http_circuit_breaker`, `build_resilient_headers` | Connect-time DNS-pinned SSRF-safe sync/async HTTP client with single-flight `HALF_OPEN` circuit breaker, bounded stream caps, and cross-origin auth stripping (`INV-LEGO-21`). |
-| `krusch_toolkit.streamlit_ui` | `render_sovereign_rag_shell`, `render_citation_badges`, `init_rag_session_state`, `append_rag_turn`, `build_airgapped_theme_css` | Air-gapped, XSS-hardened Streamlit RAG shell with offline system fonts and safe citation badge rendering (`INV-LEGO-22`). |
-| `krusch_toolkit.yaml_loader` | `parse_safe_yaml`, `dump_safe_yaml`, `validate_yaml_config`, `load_safe_yaml_pack`, `DEFAULT_YAML_LIMITS` | `_SovereignSafeLoader` YAML 1.2 Core loader blocking custom `!` tags, Norway boolean coercion, prototype pollution, path traversal, and Billion-Laughs alias bombs (`INV-LEGO-23`). |
-| `krusch_toolkit.db_async` | `create_managed_engine`, `create_managed_async_engine`, `session_scope`, `async_session_scope`, `redact_database_url`, `check_engine_health` | SQLAlchemy sync/async pool factory with automatic SQLite WAL pragmas, credential-redacted errors, and transactional scopes (`INV-LEGO-24`). |
-| `krusch_toolkit.mcp` | `define_mcp_tool`, `ok_mcp_result`, `error_mcp_result`, `validate_tool_args`, `dispatch_mcp_tool` | Python MCP tool definition & dispatch enforcing `INV-STACK-03` 4-boolean annotations (`INV-LEGO-14`). |
-| `krusch_toolkit.pg` & `.security` | `build_pg_connection_string`, `run_sql_migrations`, `pg_vector_search`, `is_private_or_reserved_ip`, `validate_outbound_url`, `verify_webhook_hmac`, `verify_bearer_token` | SQLi-guarded `pgvector` search, transactional migrations, IPv4/IPv6 SSRF validation, and constant-time HMAC/Bearer verification (`INV-LEGO-14`). |
-| `krusch_toolkit.schema` & `.upload` | `validate_json_schema`, `validate_payload`, `sanitize_upload_filename`, `sniff_mime_magic`, `verify_upload_mime`, `read_bounded_upload` | Pydantic v2 / JSON Schema payload validator and streaming byte-bounded upload + MIME magic verifier (`INV-LEGO-20`). |
-| `krusch_toolkit.embeddings` & `.raw_rag` | `embed`, `embed_batch`, `embed_chunked_centroid`, `create_raw_rag_index`, `chunk_conversation_windows` | Python 1024-dim `snowflake-arctic-embed2` client and 256/32-token source-preserving episodic RAG index. |
-
----
-
-### 4. 🏗️ Physical AI & Spatial Intelligence
-
-| Module Path | Core Exports | Description |
-|---|---|---|
-| `@krusch/toolkit/spatial-kg` | `SpatialKnowledgeGraph`, `SpatialNode`, `InfrastructureEdge` | Hierarchical 3D spatial knowledge graph for digital twins and building systems. |
-| `@krusch/toolkit/evqa-grounding` | `EvidenceGroundingEngine`, `VideoEvidenceSegment` | Evidence-backed video QA grounding for site walkthroughs. |
-| `@krusch/toolkit/hydra-action-flow` | `HydraWorldModelEngine`, `ActionFlowVector`, `createHydraEngine` | Forward spatial transition modeling and demonstration-to-policy inverse control. |
-| `@krusch/toolkit/sparse-pr` | `SparsePROptimizer`, `VideoTokenBlock`, `createSparsePROptimizer` | Block-sparse video attention and residual reconstruction. |
-| `@krusch/toolkit/physcap-policy` | `PhysicsConstraintEvaluator`, `PhysCaPPolicyGenerator` | Physics-informed spatial grounding (plumbing slope, joist boring, electrical ampacity). |
-| `@krusch/toolkit/matterport-importer`| `MatterportImporter`, `createMatterportImporter` | Ingestion and digital twin fusion of Matterport spatial sweep stations. |
-
----
-
-## 🛠️ Zero-LLM Blueprint & Rule-of-3 Scout CLI (`krusch-lego`)
+### CLI & Stdio MCP Server
 
 ```bash
-# List all 39 runtime Lego bricks + 7 starter blueprints (node | python | react | edge)
-node ./bin/krusch-lego.js list
-
-# Inspect exact import & usage snippet for a brick
-node ./bin/krusch-lego.js inspect sqlite
-
-# Stamp a runnable Node 22 TypeScript or Cloudflare Worker skeleton in <50ms with 0 LLM tokens
-node ./bin/krusch-lego.js stamp node-ts-service ./my-ts-api --port 3050
-node ./bin/krusch-lego.js stamp cloudflare-worker ./my-worker
-
-# Audit a project directory for hand-rolled boilerplate or scout cross-repo Rule-of-3 candidates
-node ./bin/krusch-lego.js audit ./my-service
-node ./bin/krusch-lego.js scout ./projects --portable --json
+node bin/hydrascope.js continual
+node bin/hydrascope.js bench
+node bin/hydrascope.js load --requests 64 --concurrency 8
+node bin/hydrascope.js query "Update partner fee rounding in calculatePartnerFee"
 ```
 
----
+Attach to Claude Code, Cursor, or Antigravity via stdio MCP (`HYDRASCOPE_WORKSPACE_ROOT` defaults to `process.cwd()` so `hydrascope_ingest_directory` can compile any repository inside your active workspace):
 
-## 💻 Code Examples
-
-### 1. Grouped Value Attention (GVA) & GPU VRAM Scheduling
-```javascript
-import { createGvaAllocator } from '@krusch/toolkit/kv-cache-manager';
-
-const allocator = createGvaAllocator({
-    node: 'gpu-worker-1',
-    totalVramBytes: 24 * 1024 * 1024 * 1024,
-    reservedModelVramBytes: 14 * 1024 * 1024 * 1024
-});
-
-const recommendation = allocator.recommendStrategy({
-    contextTokens: 32768,
-    batchSize: 2
-});
-
-console.log(recommendation.strategy); // 'GVA_COMPRESSION' or 'Q4_GVA_PERSISTENCE'
-console.log(`Footprint savings: ${recommendation.metrics.gvaSavingsPercent}%`);
-```
-
-### 2. Emergence World Multi-Agent Resilience Gate
-```javascript
-import { evaluateMultiAgentResilience } from '@krusch/toolkit/trajectory-guard';
-
-const result = evaluateMultiAgentResilience(agentHandoffs, { maxCascadeDepth: 2 });
-
-if (!result.resilient) {
-    console.warn(`Resilience Gate Alert: ${result.verdict}`, result.issues);
+```json
+{
+  "mcpServers": {
+    "hydrascope": {
+      "command": "node",
+      "args": ["/path/to/hydrascope/src/mcp/hydrascope-mcp.js"],
+      "env": {
+        "HYDRASCOPE_WORKSPACE_ROOT": "/path/to/your/workspace"
+      }
+    }
+  }
 }
 ```
 
----
+## License
 
-## 🧪 Testing & Zero-Leak Verification
-
-```bash
-# 1. Run deterministic Zero-Leak security & sanitization gate
-npm run verify:zero-leaks
-
-# 2. Run all Node.js / TypeScript unit & integration suites
-npm test
-
-# 3. Run all Python unit & integration suites
-pytest python/tests -q
-```
-
----
-
-## 📜 License
-
-[MIT](LICENSE) © `kruschdev`
+MIT License (`Copyright (c) 2026 kruschdev`). Built with pre-existing MIT open-source [`@krusch/toolkit`](https://github.com/kruschdev/toolkit) HTTP/MCP/security/embedding runtime bricks and self-hosted [`hydra-db/hydradb`](https://github.com/hydra-db/hydradb) (`v0.4.0`, ELv2).
