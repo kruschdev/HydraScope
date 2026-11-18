@@ -16,7 +16,7 @@ import {
 } from '../src/engines/structural-retriever.js';
 import { createHydraScopeRuntime } from '../src/runtime.js';
 import { buildServer } from '../src/server.js';
-import { HYDRASCOPE_MCP_TOOLS } from '../src/mcp/hydrascope-mcp.js';
+import { HYDRASCOPE_MCP_TOOLS, createHydraScopeMcp } from '../src/mcp/hydrascope-mcp.js';
 
 const HASH_STRIPE_INGRESS = 'a11ce000111122223333444455556666777788889999aaaabbbbccccddddeeee';
 const HASH_LEDGER_AUDITOR = 'b22df000111122223333444455556666777788889999aaaabbbbccccddddeeee';
@@ -651,7 +651,7 @@ test('5. Runtime ingestBrickOntology -> queryBrickOntology preserves repo AST do
     assert.ok(downstreamIds.includes('file:src/billing/settlement-batch.ts'));
     assert.ok(downstreamIds.includes('file:src/compliance/sox-reconciler.ts'));
 
-    // Verify WorkspaceRoot uses namespace-scoped surrogateVertexId and mutable props live in SET
+    // Verify WorkspaceRoot uses namespace-scoped surrogateVertexId and HydraDB v0.4.0 standalone MERGE (no trailing SET)
     const expectedRootId = surrogateVertexId(customNs, 'workspace:root');
     assert.notEqual(expectedRootId, 1000);
     const nodeMergeCalls = capturedQueries.filter((q) =>
@@ -662,9 +662,10 @@ test('5. Runtime ingestBrickOntology -> queryBrickOntology preserves repo AST do
     assert.equal(nodeMergeCalls[0].parameters.ns, customNs);
     assert.ok(
         String(nodeMergeCalls[0].query).includes(
-            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET '
+            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns, logicalId: $logicalId'
         )
     );
+    assert.equal(String(nodeMergeCalls[0].query).includes(' SET '), false);
 });
 
 test('6. Un-dated asOf supersession, cross-org :SUPERSEDES isolation, bare brickId guard, ^bricks/ root anchor, and pre-slugification scrubbing', async () => {
@@ -831,7 +832,7 @@ test('7. HTTP /api/ontology/ingest and /api/ontology/query routes honor Bearer a
     assert.equal(HYDRASCOPE_MCP_TOOLS.length, 6);
 
     const adminToken = 'hs-ontology-route-secret';
-    const { server, close } = await buildServer({
+    const { server, runtime, close } = await buildServer({
         dbPath: ':memory:',
         adminToken,
         runtimeOptions: { preferOllama: false, hydraUrl: '' },
@@ -905,4 +906,9 @@ test('7. HTTP /api/ontology/ingest and /api/ontology/query routes honor Bearer a
     const callerIds = queryJson.data.downstreamRepoCallers.map((c) => c.id);
     assert.ok(callerIds.includes('file:src/billing/settlement-batch.ts'));
     assert.ok(callerIds.includes('file:src/compliance/sox-reconciler.ts'));
+
+    // MCP hydrascope_traverse_context with includeBrickOntology=true enriches structural traversal while preserving 6 MCP tools
+    const mcpInstance = createHydraScopeMcp({ runtime, connect: false });
+    assert.equal(HYDRASCOPE_MCP_TOOLS.length, 6);
+    assert.ok(mcpInstance);
 });

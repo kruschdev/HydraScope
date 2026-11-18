@@ -1,13 +1,57 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { openSqliteDb } from '@krusch/toolkit/sqlite';
 import {
     defineMcpTool,
     createMcpServer,
     okMcpResult,
     errorMcpResult
 } from '@krusch/toolkit/mcp';
+
+function loadSealedBricksFromSqlite(dbPath) {
+    const clean = String(dbPath || '').trim();
+    if (!clean || !existsSync(clean)) return [];
+    let handle = null;
+    try {
+        handle = openSqliteDb(clean, { readOnly: true, wal: false });
+        const tables = new Set(
+            handle.db
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+                .all()
+                .map((t) => String(t.name || ''))
+        );
+        const tableName = tables.has('sealed_bricks')
+            ? 'sealed_bricks'
+            : tables.has('brick_exchange_bricks')
+              ? 'brick_exchange_bricks'
+              : '';
+        if (!tableName) return [];
+        const rows = handle.db
+            .prepare(`SELECT bundle_json FROM ${tableName} ORDER BY created_at ASC`)
+            .all();
+        const bundles = [];
+        for (const row of rows) {
+            if (!row || typeof row.bundle_json !== 'string') continue;
+            try {
+                const parsed = JSON.parse(row.bundle_json);
+                if (parsed && typeof parsed === 'object') bundles.push(parsed);
+            } catch {
+                /* skip malformed row */
+            }
+        }
+        return bundles;
+    } catch {
+        return [];
+    } finally {
+        try {
+            handle?.close();
+        } catch {
+            /* ignore close error */
+        }
+    }
+}
 
 export const HYDRASCOPE_MCP_TOOLS = Object.freeze([
     defineMcpTool({
@@ -42,6 +86,27 @@ export const HYDRASCOPE_MCP_TOOLS = Object.freeze([
                     default: 'hydradb',
                     description:
                         'Traversal backend: "hydradb" (default OpenCypher structural retriever) or "selfgraph" (@hydradb/selfgraph Personalized PageRank & asOf/knownAt replay).'
+                },
+                includeBrickOntology: {
+                    type: 'boolean',
+                    description:
+                        'When true (or when targetStack/targetChannel/requiredPorts are provided), also queries the 4-Axis Brick Ontology (SoftwareStack, DataPort, Channel, MoEProfile) and :GOVERNS downstream AST callers.'
+                },
+                targetStack: {
+                    type: 'string',
+                    description:
+                        'Optional 4-Axis Ontology runtime stack filter (node-esm, typescript-node, python-fastapi, react-vite, cloudflare-edge).'
+                },
+                targetChannel: {
+                    type: 'string',
+                    description:
+                        'Optional 4-Axis Ontology channel filter (e.g. webhook:stripe, webhook:github, workspace:gmail, telemetry:timeseries).'
+                },
+                requiredPorts: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Optional canonical or namespaced data ports for 1-to-2-hop brick composition (e.g. ["ledger_event", "audit_record"]).'
                 }
             },
             required: ['query']
@@ -195,24 +260,54 @@ export function createHydraScopeMcp({ runtime, connect = false } = {}) {
                 case 'hydrascope_traverse_context': {
                     const query = String(args.query || '').trim();
                     if (!query) return errorMcpResult(name, 'INVALID_ARGUMENTS', 'query is required.');
+                    const asOf = args.asOf ? String(args.asOf).trim() : null;
+                    const maxHops = Number(args.maxHops) || 3;
                     const useSelfGraph = String(args.engine || '').trim().toLowerCase() === 'selfgraph';
                     const res =
                         useSelfGraph && typeof runtime.selfGraphRetrieve === 'function'
                             ? await runtime.selfGraphRetrieve({
                                   query,
-                                  asOf: args.asOf ? String(args.asOf).trim() : null,
+                                  asOf,
                                   budgetTokens: Number(args.tokenBudget) || 900,
-                                  depth: Number(args.maxHops) || 3
+                                  depth: maxHops
                               })
                             : await runtime.traverse({
                                   query,
-                                  asOf: args.asOf ? String(args.asOf).trim() : null,
+                                  asOf,
                                   tokenBudget: Number(args.tokenBudget) || 900,
-                                  maxHops: Number(args.maxHops) || 3
+                                  maxHops
                               });
-                    return res.ok
-                        ? okMcpResult(name, res.summary, res.data)
-                        : errorMcpResult(name, res.error?.code || 'TRAVERSE_FAILED', res.error?.message || 'Traversal failed');
+                    if (!res.ok) {
+                        return errorMcpResult(
+                            name,
+                            res.error?.code || 'TRAVERSE_FAILED',
+                            res.error?.message || 'Traversal failed'
+                        );
+                    }
+
+                    const wantsOntology =
+                        Boolean(args.includeBrickOntology) ||
+                        Boolean(args.targetStack) ||
+                        Boolean(args.targetChannel) ||
+                        (Array.isArray(args.requiredPorts) && args.requiredPorts.length > 0);
+                    if (wantsOntology && typeof runtime.queryBrickOntology === 'function') {
+                        const ontRes = await runtime.queryBrickOntology({
+                            query,
+                            targetStack: args.targetStack ? String(args.targetStack).trim() : null,
+                            targetChannel: args.targetChannel ? String(args.targetChannel).trim() : null,
+                            requiredPorts: Array.isArray(args.requiredPorts) ? args.requiredPorts : [],
+                            asOf,
+                            maxHops: Math.min(2, maxHops)
+                        });
+                        if (ontRes.ok) {
+                            return okMcpResult(name, `${res.summary} | ${ontRes.summary}`, {
+                                ...res.data,
+                                brickOntology: ontRes.data
+                            });
+                        }
+                    }
+
+                    return okMcpResult(name, res.summary, res.data);
                 }
                 case 'hydrascope_check_answerable': {
                     const query = String(args.query || '').trim();
@@ -289,5 +384,12 @@ if (isDirectEntrypoint(import.meta.url, process.argv[1])) {
     const { createHydraScopeRuntime } = await import('../runtime.js');
     const workspaceRoot = String(process.env.HYDRASCOPE_WORKSPACE_ROOT || process.cwd()).trim();
     const runtime = await createHydraScopeRuntime(workspaceRoot ? { projectRoot: workspaceRoot } : {});
+    const brickDbPath = String(process.env.HYDRASCOPE_BRICK_DB_PATH || '').trim();
+    if (brickDbPath && typeof runtime.ingestBrickOntology === 'function') {
+        const seededBundles = loadSealedBricksFromSqlite(brickDbPath);
+        if (seededBundles.length > 0) {
+            await runtime.ingestBrickOntology({ bricks: seededBundles });
+        }
+    }
     await createHydraScopeMcp({ runtime, connect: true });
 }

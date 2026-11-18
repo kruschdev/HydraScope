@@ -625,7 +625,7 @@ export function createHydraOpenCypherClient(options = {}) {
 
         const rootVertexId = surrogateVertexId(safeNamespace, 'workspace:root');
         const baseNodeCypher =
-            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET n.logicalId = $logicalId, n.kind = $kind, n.title = $title, n.path = $path, n.isCurrent = $isCurrent';
+            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns, logicalId: $logicalId, kind: $kind, title: $title, path: $path, isCurrent: $isCurrent})';
 
         const vertexIdByLogicalId = new Map();
         const nodeOps = [];
@@ -651,12 +651,14 @@ export function createHydraOpenCypherClient(options = {}) {
             const isCurrent =
                 typeof rawNode.isCurrent === 'boolean' ? rawNode.isCurrent : !rawNode.retiredAt;
 
-            const setClauses = [
-                'n.logicalId = $logicalId',
-                'n.kind = $kind',
-                'n.title = $title',
-                'n.path = $path',
-                'n.isCurrent = $isCurrent',
+            const propEntries = [
+                'id: $id',
+                'namespace: $ns',
+                'logicalId: $logicalId',
+                'kind: $kind',
+                'title: $title',
+                'path: $path',
+                'isCurrent: $isCurrent',
             ];
             /** @type {Record<string, unknown>} */
             const parameters = {
@@ -675,7 +677,7 @@ export function createHydraOpenCypherClient(options = {}) {
                     ? rawNode.summary.trim()
                     : '';
             if (summaryText) {
-                setClauses.push('n.summary = $summary');
+                propEntries.push('summary: $summary');
                 parameters.summary = summaryText;
             }
             const retiredAtText =
@@ -683,7 +685,7 @@ export function createHydraOpenCypherClient(options = {}) {
                     ? rawNode.retiredAt.trim()
                     : '';
             if (retiredAtText) {
-                setClauses.push('n.retiredAt = $retiredAt');
+                propEntries.push('retiredAt: $retiredAt');
                 parameters.retiredAt = retiredAtText;
             }
             const supersededByText =
@@ -691,11 +693,12 @@ export function createHydraOpenCypherClient(options = {}) {
                     ? rawNode.supersededBy.trim()
                     : '';
             if (supersededByText) {
-                setClauses.push('n.supersededBy = $supersededBy');
+                propEntries.push('supersededBy: $supersededBy');
                 parameters.supersededBy = supersededByText;
             }
 
-            const statementCypher = `MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET ${setClauses.join(', ')}`;
+            // HydraDB v0.4.0 Rust OpenCypher engine requires standalone MERGE property maps without trailing SET clauses
+            const statementCypher = `MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {${propEntries.join(', ')}})`;
             nodeCypherSet.add(statementCypher);
             nodeOps.push({
                 cypher: statementCypher,
@@ -720,7 +723,7 @@ export function createHydraOpenCypherClient(options = {}) {
             distinctEdgeTypes.add(safeType);
 
             edgeOps.push({
-                cypher: `MERGE (a:GraphNode {id: $fromId, namespace: $ns})-[:${safeType}]->(b:GraphNode {id: $toId, namespace: $ns}) SET a.logicalId = $fromLogicalId, b.logicalId = $toLogicalId`,
+                cypher: `MERGE (a:GraphNode {id: $fromId, namespace: $ns, logicalId: $fromLogicalId})-[:${safeType}]->(b:GraphNode {id: $toId, namespace: $ns, logicalId: $toLogicalId})`,
                 parameters: {
                     ns: safeNamespace,
                     fromId:
@@ -739,7 +742,7 @@ export function createHydraOpenCypherClient(options = {}) {
             ...(nodeOps.length > 0 ? [...(nodeCypherSet.size > 0 ? nodeCypherSet : [baseNodeCypher])] : []),
             ...[...distinctEdgeTypes].map(
                 (t) =>
-                    `MERGE (a:GraphNode {id: $fromId, namespace: $ns})-[:${t}]->(b:GraphNode {id: $toId, namespace: $ns}) SET a.logicalId = $fromLogicalId, b.logicalId = $toLogicalId`
+                    `MERGE (a:GraphNode {id: $fromId, namespace: $ns, logicalId: $fromLogicalId})-[:${t}]->(b:GraphNode {id: $toId, namespace: $ns, logicalId: $toLogicalId})`
             ),
         ];
 
