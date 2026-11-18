@@ -138,7 +138,7 @@ node bin/hydrascope.js load --requests 64 --concurrency 8
 node bin/hydrascope.js query "Update partner fee rounding in calculatePartnerFee"
 ```
 
-Attach to Claude Code, Cursor, or Antigravity via stdio MCP (`HYDRASCOPE_WORKSPACE_ROOT` defaults to `process.cwd()` so `hydrascope_ingest_directory` can compile any repository inside your active workspace):
+Attach to Claude Code, Cursor, or Antigravity via stdio MCP (`HYDRASCOPE_WORKSPACE_ROOT` defaults to `process.cwd()` so `hydrascope_ingest_directory` can compile any repository inside your active workspace; optional `HYDRASCOPE_BRICK_DB_PATH` auto-hydrates sealed Brick Exchange SQLite bundles from `sealed_bricks` / `brick_exchange_bricks` into the 6-tool MCP server on startup):
 
 ```json
 {
@@ -147,7 +147,8 @@ Attach to Claude Code, Cursor, or Antigravity via stdio MCP (`HYDRASCOPE_WORKSPA
       "command": "node",
       "args": ["/path/to/hydrascope/src/mcp/hydrascope-mcp.js"],
       "env": {
-        "HYDRASCOPE_WORKSPACE_ROOT": "/path/to/your/workspace"
+        "HYDRASCOPE_WORKSPACE_ROOT": "/path/to/your/workspace",
+        "HYDRASCOPE_BRICK_DB_PATH": "/path/to/brick-exchange.db"
       }
     }
   }
