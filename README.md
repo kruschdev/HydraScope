@@ -102,6 +102,14 @@ HydraScope talks directly to the open-source `ghcr.io/hydra-db/hydradb:0.4.0` HT
 
 ## Quick Start
 
+### Agent-Assisted Setup
+
+Ask your coding agent (Claude Code, Codex, Cursor, Windsurf, or Antigravity):
+
+```text
+Read https://raw.githubusercontent.com/kruschdev/HydraScope/main/INSTALL.md and set up HydraScope on this machine.
+```
+
 ```bash
 cp .env.example .env
 npm install
