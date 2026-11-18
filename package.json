@@ -12,6 +12,22 @@
   "engines": {
     "node": ">=22.0.0"
   },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "bin",
+    "src",
+    "client",
+    "config.json",
+    "Dockerfile",
+    "docker-compose.yml",
+    ".env.example",
+    "INSTALL.md",
+    "spec.md",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "hydrascope": "./bin/hydrascope.js",
     "hydrascope-mcp": "./src/mcp/hydrascope-mcp.js"
@@ -29,6 +45,9 @@
     "build": "npm --prefix client run build",
     "test": "NODE_ENV=test node --test tests/*.test.js"
   },
+  "bundleDependencies": [
+    "@hydradb/selfgraph"
+  ],
   "dependencies": {
     "@hydradb/selfgraph": "file:vendor/hydradb-selfgraph-0.2.1.tgz",
     "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b22f25c34e000bada54e681ccfafc13a05409261.tar.gz",
