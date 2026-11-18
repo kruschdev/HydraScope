@@ -27,6 +27,24 @@ export const BRICK_ONTOLOGY_EDGE_TYPES = Object.freeze([
 ]);
 
 const BRICK_ONTOLOGY_EDGE_SET = new Set(BRICK_ONTOLOGY_EDGE_TYPES);
+const REPO_AST_EDGE_SET = new Set([
+    'IMPORTS',
+    'IMPACTS',
+    'CALLS',
+    'DEPENDS_ON',
+    'READS_ENV',
+    'TOUCHED',
+    'TUNED_IN',
+]);
+const ONTOLOGY_NODE_KINDS = new Set([
+    'brick',
+    'stack',
+    'port',
+    'channel',
+    'moe_profile',
+    'org_profile',
+]);
+const HEX_64_RE = /^[0-9a-f]{64}$/i;
 
 const CANONICAL_STACK_META = Object.freeze({
     'node-esm': Object.freeze({
@@ -213,7 +231,7 @@ function splitSearchTokens(raw) {
  * @returns {string}
  */
 function normalizeEntitySlug(raw, expectedPrefix) {
-    const text = String(raw ?? '').trim();
+    const text = scrubSensitiveText(String(raw ?? '').trim()).trim();
     if (!text) return '';
     const prefixLower = `${expectedPrefix.toLowerCase()}:`;
     const stripped = text.toLowerCase().startsWith(prefixLower)
@@ -354,32 +372,48 @@ function inferOntologyNodeKind(id) {
  * @returns {string}
  */
 function buildDefaultOntologyPath(id, kind) {
-    if (kind === 'brick' || id.startsWith('brick:')) {
-        const { brickId, hash } = parseBrickLogicalId(id);
-        const safeBrick = (brickId || 'unknown').replace(/[^A-Za-z0-9_-]+/g, '-');
+    const cleanId = scrubSensitiveText(String(id || ''));
+    if (kind === 'brick' || cleanId.startsWith('brick:')) {
+        const { brickId, hash } = parseBrickLogicalId(cleanId);
+        const safeBrick = (scrubSensitiveText(brickId) || 'unknown').replace(/[^A-Za-z0-9_-]+/g, '-');
         const suffix = hash ? `@${hash.slice(0, 12)}` : '';
         return `ontology/bricks/${safeBrick}${suffix}.json`;
     }
-    const safeSlug = id.replace(/:/g, '/').replace(/[^A-Za-z0-9/_-]+/g, '-');
+    const safeSlug = cleanId.replace(/:/g, '/').replace(/[^A-Za-z0-9/_-]+/g, '-');
     return `ontology/${safeSlug}.json`;
 }
 
 /**
- * Evaluate whether `node` is active at `asOf` (`!isCurrent` retired nodes excluded unless `asOf < retiredAt`).
+ * Evaluate whether `node` is active at `asOf` (`!isCurrent` retired nodes excluded unless `asOf < retiredAt`,
+ * or when `!node.retiredAt` and `node.isCurrent === false`, inactive unless `supersededBy` node's `validFrom > asOf`).
  *
  * @param {object} node
  * @param {string | null} [asOf=null]
+ * @param {Map<string, any> | null} [nodeById=null]
  * @returns {boolean}
  */
-function isOntologyNodeActiveAt(node, asOf = null) {
+function isOntologyNodeActiveAt(node, asOf = null, nodeById = null) {
     if (!node || typeof node !== 'object') return false;
     const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
     if (!cleanAsOf || !isValidIsoDate(cleanAsOf)) {
         return node.isCurrent !== false && !node.retiredAt;
     }
     const validOk = !node.validFrom || node.validFrom <= cleanAsOf;
-    const notRetiredYet = !node.retiredAt || cleanAsOf < node.retiredAt;
-    return validOk && notRetiredYet;
+    if (!validOk) return false;
+    if (node.retiredAt) {
+        return cleanAsOf < node.retiredAt;
+    }
+    if (node.isCurrent === false) {
+        const repl =
+            node.supersededBy && nodeById instanceof Map ? nodeById.get(node.supersededBy) : null;
+        return Boolean(
+            repl &&
+                typeof repl.validFrom === 'string' &&
+                isValidIsoDate(repl.validFrom) &&
+                repl.validFrom > cleanAsOf
+        );
+    }
+    return true;
 }
 
 /**
@@ -552,12 +586,18 @@ export function compileExchangeSnapshotToHydraGraph(
         if (typeof raw.portNamespace === 'string' && raw.portNamespace) {
             node.portNamespace = scrubSensitiveText(raw.portNamespace);
         }
+        if (typeof raw.orgId === 'string' && raw.orgId.trim()) {
+            const cleanOrgId = normalizeEntitySlug(raw.orgId, 'org').toLowerCase();
+            if (cleanOrgId) {
+                node.orgId = cleanOrgId;
+            }
+        }
 
         nodeById.set(cleanId, node);
         return node;
     };
 
-    const addOntologyEdge = (from, to, rawType) => {
+    const addOntologyEdge = (from, to, rawType, extraReason = null) => {
         const cleanFrom = scrubSensitiveText(String(from ?? '').trim());
         const cleanTo = scrubSensitiveText(String(to ?? '').trim());
         const cleanType = String(rawType ?? '')
@@ -565,14 +605,20 @@ export function compileExchangeSnapshotToHydraGraph(
             .toUpperCase()
             .replace(/[\s-]+/g, '_');
         if (!cleanFrom || !cleanTo || cleanFrom === cleanTo) return;
-        if (!BRICK_ONTOLOGY_EDGE_SET.has(cleanType)) return;
+        const isOntEdge = BRICK_ONTOLOGY_EDGE_SET.has(cleanType);
+        const isRepoEdge = REPO_AST_EDGE_SET.has(cleanType);
+        if (!isOntEdge && !isRepoEdge) return;
         const key = `${cleanFrom}|${cleanType}|${cleanTo}`;
         if (!edgeByKey.has(key)) {
-            edgeByKey.set(key, {
+            const edgeObj = {
                 from: cleanFrom,
                 to: cleanTo,
                 type: cleanType,
-            });
+            };
+            if (isRepoEdge && typeof extraReason === 'string' && extraReason.trim()) {
+                edgeObj.reason = scrubSensitiveText(extraReason.trim());
+            }
+            edgeByKey.set(key, edgeObj);
         }
     };
 
@@ -729,6 +775,12 @@ export function compileExchangeSnapshotToHydraGraph(
                           ? !parsedPort.namespaced
                           : undefined,
                 portNamespace: rawNode.portNamespace || parsedPort?.namespace || undefined,
+                orgId:
+                    rawNode.orgId ??
+                    rawNode.org ??
+                    rawNode.ontology?.orgId ??
+                    rawNode.lineage?.orgId ??
+                    rawNode.publisher?.orgId,
                 validFrom: rawNode.validFrom ?? rawNode.ontology?.validFrom ?? rawNode.createdAt,
                 retiredAt: rawNode.retiredAt ?? rawNode.ontology?.retiredAt,
                 isCurrent: rawNode.isCurrent,
@@ -737,16 +789,15 @@ export function compileExchangeSnapshotToHydraGraph(
 
             if (created && (kind === 'brick' || created.id.startsWith('brick:'))) {
                 registerBrickAlias(created.id, created.id);
-                if (parsedBrick?.brickId) {
-                    registerBrickAlias(parsedBrick.brickId, created.id);
-                    if (parsedBrick.hash) {
+                if (parsedBrick?.brickId && parsedBrick.hash) {
+                    if (HEX_64_RE.test(parsedBrick.hash)) {
                         registerBrickAlias(parsedBrick.hash, created.id);
-                        registerBrickAlias(`${parsedBrick.brickId}@${parsedBrick.hash}`, created.id);
-                        registerBrickAlias(
-                            `${parsedBrick.brickId}@${parsedBrick.hash.slice(0, 12)}`,
-                            created.id
-                        );
                     }
+                    registerBrickAlias(`${parsedBrick.brickId}@${parsedBrick.hash}`, created.id);
+                    registerBrickAlias(
+                        `${parsedBrick.brickId}@${parsedBrick.hash.slice(0, 12)}`,
+                        created.id
+                    );
                 }
                 const supRaw = rawNode.supersedes ?? rawNode.ontology?.supersedes;
                 const supList = Array.isArray(supRaw) ? supRaw : supRaw ? [supRaw] : [];
@@ -765,11 +816,12 @@ export function compileExchangeSnapshotToHydraGraph(
                 .trim()
                 .toUpperCase()
                 .replace(/[\s-]+/g, '_');
-            if (!from || !to || !BRICK_ONTOLOGY_EDGE_SET.has(type)) continue;
+            if (!from || !to) continue;
+            if (!BRICK_ONTOLOGY_EDGE_SET.has(type) && !REPO_AST_EDGE_SET.has(type)) continue;
             if (type === 'SUPERSEDES') {
                 pendingSupersedes.push({ newerId: from, olderRef: to });
             } else {
-                addOntologyEdge(from, to, type);
+                addOntologyEdge(from, to, type, edge.reason || null);
             }
         }
     }
@@ -802,13 +854,16 @@ export function compileExchangeSnapshotToHydraGraph(
     const orgProfiles = Array.isArray(unwrapped.orgProfiles) ? unwrapped.orgProfiles : [];
     for (const org of orgProfiles) {
         if (!isPlainObject(org)) continue;
-        const slug = normalizeEntitySlug(org.orgId || org.id || org.slug || org.name, 'org');
+        const rawOrgIdent = scrubSensitiveText(String(org.orgId || org.id || org.slug || org.name || '').trim());
+        const slug = normalizeEntitySlug(rawOrgIdent, 'org');
         if (!slug) continue;
-        const orgNodeId = `org:${slug}`;
+        const safeOrgSlug = scrubSensitiveText(slug).replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+        if (!safeOrgSlug || FORBIDDEN_OBJECT_KEYS.has(safeOrgSlug)) continue;
+        const orgNodeId = `org:${safeOrgSlug}`;
         const orgStacks = uniqueSafeStrings(org.stacks || org.usesStacks || []);
         const orgChannels = uniqueSafeStrings(org.channels || org.listensChannels || []);
         const orgPorts = uniqueSafeStrings(org.requiredPorts || org.requiresPorts || []);
-        const title = org.title || org.name || `Organization ${slug}`;
+        const title = scrubSensitiveText(String(org.title || org.name || `Organization ${safeOrgSlug}`).trim());
         const content =
             org.content ||
             org.summary ||
@@ -818,9 +873,10 @@ export function compileExchangeSnapshotToHydraGraph(
             id: orgNodeId,
             kind: 'org_profile',
             title,
-            path: `ontology/orgs/${slug.replace(/[^A-Za-z0-9_-]+/g, '-')}.json`,
+            path: `ontology/orgs/${safeOrgSlug}.json`,
             content,
-            symbols: [slug],
+            symbols: [safeOrgSlug],
+            orgId: safeOrgSlug,
             validFrom: org.validFrom ?? org.createdAt,
             retiredAt: org.retiredAt,
             isCurrent: org.isCurrent,
@@ -859,17 +915,32 @@ export function compileExchangeSnapshotToHydraGraph(
               ? rawBrick.blueprint.ontology
               : {};
 
-        const parsedFromId = typeof rawBrick.id === 'string' ? parseBrickLogicalId(rawBrick.id) : { brickId: '', hash: '' };
-        const brickId = String(
-            rawBrick.brickId ||
-                rawBrick.blueprint?.id ||
-                parsedFromId.brickId ||
-                rawBrick.name ||
-                ''
-        )
-            .trim()
-            .replace(/[^A-Za-z0-9_-]+/g, '-');
+        const parsedFromId =
+            typeof rawBrick.id === 'string'
+                ? parseBrickLogicalId(scrubSensitiveText(rawBrick.id))
+                : { brickId: '', hash: '' };
+        const rawBrickIdent = scrubSensitiveText(
+            String(
+                rawBrick.brickId ||
+                    rawBrick.blueprint?.id ||
+                    parsedFromId.brickId ||
+                    rawBrick.name ||
+                    ''
+            ).trim()
+        );
+        const brickId = rawBrickIdent
+            .replace(/[^A-Za-z0-9_-]+/g, '-')
+            .replace(/^-+|-+$/g, '');
         if (!brickId || FORBIDDEN_OBJECT_KEYS.has(brickId)) continue;
+
+        const brickOrgRaw =
+            rawBrick.orgId ??
+            rawBrick.org ??
+            ont.orgId ??
+            rawBrick.lineage?.orgId ??
+            rawBrick.publisher?.orgId ??
+            rawBrick.blueprint?.orgId ??
+            null;
 
         const explicitHash = sanitizeBrickHashToken(
             rawBrick.lineage?.sourceHash ||
@@ -948,6 +1019,7 @@ export function compileExchangeSnapshotToHydraGraph(
             symbols: uniqueSafeStrings([brickId, ...capabilities]),
             synonyms: uniqueSafeStrings(rawBrick.synonyms || []),
             brickId,
+            orgId: brickOrgRaw,
             validFrom,
             retiredAt,
             isCurrent: rawBrick.isCurrent,
@@ -956,19 +1028,22 @@ export function compileExchangeSnapshotToHydraGraph(
         if (!brickNode) continue;
 
         registerBrickAlias(canonicalBrickNodeId, brickNode.id);
-        registerBrickAlias(brickId, brickNode.id);
-        registerBrickAlias(resolvedHash, brickNode.id);
+        if (HEX_64_RE.test(resolvedHash)) {
+            registerBrickAlias(resolvedHash, brickNode.id);
+        }
         registerBrickAlias(`${brickId}@${resolvedHash}`, brickNode.id);
         if (resolvedHash.length > 12) {
-            registerBrickAlias(resolvedHash.slice(0, 12), brickNode.id);
             registerBrickAlias(`${brickId}@${resolvedHash.slice(0, 12)}`, brickNode.id);
         }
         if (resolvedHash.length > 8) {
-            registerBrickAlias(resolvedHash.slice(0, 8), brickNode.id);
             registerBrickAlias(`${brickId}@${resolvedHash.slice(0, 8)}`, brickNode.id);
         }
-        if (typeof rawBrick.id === 'string' && rawBrick.id.trim()) {
-            registerBrickAlias(rawBrick.id.trim(), brickNode.id);
+        if (
+            typeof rawBrick.id === 'string' &&
+            rawBrick.id.trim() &&
+            rawBrick.id.includes('@')
+        ) {
+            registerBrickAlias(scrubSensitiveText(rawBrick.id.trim()), brickNode.id);
         }
 
         for (const s of stacks) {
@@ -1013,14 +1088,39 @@ export function compileExchangeSnapshotToHydraGraph(
         }
     }
 
+    const isQualifiedBrickReference = (rawRef) => {
+        const stripped = normalizeEntitySlug(rawRef, 'brick');
+        if (!stripped) return false;
+        if (HEX_64_RE.test(stripped)) return true;
+        if (stripped.includes('@')) {
+            const parsed = parseBrickLogicalId(rawRef);
+            return Boolean(parsed.brickId && parsed.hash);
+        }
+        return false;
+    };
+
     const resolveBrickRef = (ref, excludeId = '') => {
-        const cleanRef = String(ref ?? '').trim();
+        const cleanRef = scrubSensitiveText(String(ref ?? '').trim());
         if (!cleanRef) return null;
-        if (nodeById.has(cleanRef) && cleanRef !== excludeId) return cleanRef;
+
+        if (nodeById.has(cleanRef) && cleanRef !== excludeId) {
+            const existing = nodeById.get(cleanRef);
+            const isBrick = existing?.kind === 'brick' || cleanRef.startsWith('brick:');
+            if (!isBrick || isQualifiedBrickReference(cleanRef)) {
+                return cleanRef;
+            }
+            return null;
+        }
+
+        if (!isQualifiedBrickReference(cleanRef)) {
+            return null;
+        }
 
         const pickCandidate = (key) => {
-            const candidates = brickAliasIndex.get(key) || brickAliasIndex.get(key.toLowerCase()) || [];
-            return candidates.find((cid) => cid !== excludeId && nodeById.has(cid)) || null;
+            const candidates =
+                brickAliasIndex.get(key) || brickAliasIndex.get(key.toLowerCase()) || [];
+            const valid = candidates.filter((cid) => cid !== excludeId && nodeById.has(cid));
+            return valid.length === 1 ? valid[0] : null;
         };
 
         const directMatch = pickCandidate(cleanRef);
@@ -1034,29 +1134,81 @@ export function compileExchangeSnapshotToHydraGraph(
         return null;
     };
 
-    // Resolve `:SUPERSEDES` lineage across bricks (`v2 -> v1`)
+    // Resolve and sort `:SUPERSEDES` lineage deterministically (`v2 -> v1`)
+    const resolvedSupersedes = [];
+    const seenSupersedePairs = new Set();
     for (const { newerId: rawNewer, olderRef } of pendingSupersedes) {
-        const newerCanonicalId = resolveBrickRef(rawNewer) || rawNewer;
-        const olderCanonicalId = resolveBrickRef(olderRef, newerCanonicalId);
+        const newerCanonicalId = resolveBrickRef(rawNewer) || (nodeById.has(rawNewer) ? rawNewer : null);
+        const olderCanonicalId = resolveBrickRef(olderRef, newerCanonicalId || '');
         if (!newerCanonicalId || !olderCanonicalId || newerCanonicalId === olderCanonicalId) continue;
+        const pairKey = `${newerCanonicalId}|${olderCanonicalId}`;
+        if (seenSupersedePairs.has(pairKey)) continue;
+        seenSupersedePairs.add(pairKey);
+        resolvedSupersedes.push({ newerCanonicalId, olderCanonicalId });
+    }
 
+    resolvedSupersedes.sort((a, b) => {
+        const olderA = nodeById.get(a.olderCanonicalId)?.validFrom || '';
+        const olderB = nodeById.get(b.olderCanonicalId)?.validFrom || '';
+        if (olderA !== olderB) return olderA < olderB ? -1 : 1;
+        const newerA = nodeById.get(a.newerCanonicalId)?.validFrom || '';
+        const newerB = nodeById.get(b.newerCanonicalId)?.validFrom || '';
+        if (newerA !== newerB) return newerA < newerB ? -1 : 1;
+        if (a.newerCanonicalId !== b.newerCanonicalId) {
+            return a.newerCanonicalId < b.newerCanonicalId ? -1 : 1;
+        }
+        return a.olderCanonicalId < b.olderCanonicalId
+            ? -1
+            : a.olderCanonicalId > b.olderCanonicalId
+              ? 1
+              : 0;
+    });
+
+    const createsSupersedesCycle = (newerId, olderId) => {
+        // Adding `newerId --[:SUPERSEDES]--> olderId` creates a cycle iff `olderId` already reaches `newerId`
+        // via outgoing `:SUPERSEDES` edges (or `newerId` reaches `olderId` via `supersededBy`).
+        const visited = new Set([olderId]);
+        const stack = [olderId];
+        while (stack.length > 0) {
+            const curr = stack.pop();
+            if (curr === newerId) return true;
+            for (const edge of edgeByKey.values()) {
+                if (edge.type === 'SUPERSEDES' && edge.from === curr && !visited.has(edge.to)) {
+                    visited.add(edge.to);
+                    stack.push(edge.to);
+                }
+            }
+        }
+
+        let cursor = nodeById.get(newerId)?.supersededBy || null;
+        const seenChain = new Set([newerId]);
+        while (cursor && !seenChain.has(cursor)) {
+            if (cursor === olderId) return true;
+            seenChain.add(cursor);
+            cursor = nodeById.get(cursor)?.supersededBy || null;
+        }
+        return false;
+    };
+
+    for (const { newerCanonicalId, olderCanonicalId } of resolvedSupersedes) {
         const newerNode = nodeById.get(newerCanonicalId);
         const olderNode = nodeById.get(olderCanonicalId);
         if (!newerNode || !olderNode) continue;
 
-        // Guard against accidental 2-node or transitive cycles
-        let cursor = newerNode.supersededBy;
-        const seenChain = new Set([newerCanonicalId]);
-        let createsCycle = false;
-        while (cursor && !seenChain.has(cursor)) {
-            if (cursor === olderCanonicalId) {
-                createsCycle = true;
-                break;
-            }
-            seenChain.add(cursor);
-            cursor = nodeById.get(cursor)?.supersededBy || null;
+        // Enforce same-organization isolation (`!newer.orgId || !older.orgId || newer.orgId === older.orgId`)
+        if (newerNode.orgId && olderNode.orgId && newerNode.orgId !== olderNode.orgId) {
+            continue;
         }
-        if (createsCycle) continue;
+
+        // Guard against 2-node or multi-hop cycles
+        if (createsSupersedesCycle(newerCanonicalId, olderCanonicalId)) {
+            continue;
+        }
+
+        // Prevent overwriting an earlier chronological superseder if `olderNode` was already retired by another version
+        if (olderNode.supersededBy && olderNode.supersededBy !== newerNode.id) {
+            continue;
+        }
 
         olderNode.isCurrent = false;
         olderNode.supersededBy = newerNode.id;
@@ -1087,7 +1239,11 @@ export function compileExchangeSnapshotToHydraGraph(
         };
     });
     const finalEdges = (Array.isArray(scrubbed.edges) ? scrubbed.edges : []).filter(
-        (edge) => edge && edge.from && edge.to && BRICK_ONTOLOGY_EDGE_SET.has(edge.type)
+        (edge) =>
+            edge &&
+            edge.from &&
+            edge.to &&
+            (BRICK_ONTOLOGY_EDGE_SET.has(edge.type) || REPO_AST_EDGE_SET.has(edge.type))
     );
     const totalRepoTokens = finalNodes.reduce((sum, n) => sum + n.tokens, 0);
     const ontology = /** @type {any} */ (scrubSensitiveStrings(buildHydraOntologyFacet(finalNodes)));
@@ -1128,9 +1284,9 @@ function matchVendoredBrickIdFromRepoNode(repoNode) {
     }
 
     const vendoredRe =
-        /(?:^|\/)bricks\/([A-Za-z0-9][A-Za-z0-9_-]*)\/(?:index|binding|binding_adapter)\.(?:js|ts|mjs|cjs|jsx|tsx|py)$/i;
+        /^(?:\.\/)?bricks\/([A-Za-z0-9][A-Za-z0-9_-]*)\/(?:index|binding|binding_adapter)\.(?:js|ts|mjs|cjs|jsx|tsx|py)$/i;
     for (const candidate of candidates) {
-        const normalized = candidate.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+        const normalized = candidate.replace(/\\/g, '/');
         const match = vendoredRe.exec(normalized);
         if (match && !FORBIDDEN_OBJECT_KEYS.has(match[1])) {
             return match[1];
@@ -1221,8 +1377,13 @@ export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph) {
     }
     for (const on of baseOnt.nodes) {
         const cloned = cloneNode(on);
-        if (cloned && !mergedNodesById.has(cloned.id)) {
-            mergedNodesById.set(cloned.id, cloned);
+        if (!cloned) continue;
+        const existing = mergedNodesById.get(cloned.id);
+        if (!existing || ONTOLOGY_NODE_KINDS.has(cloned.kind)) {
+            mergedNodesById.set(cloned.id, {
+                ...cloned,
+                surrogateId: surrogateVertexId(mergedNamespace, cloned.id),
+            });
         }
     }
 
@@ -1380,7 +1541,7 @@ function findActiveSupersedingBrickId(retiredId, nodeById, edges, asOf) {
         if (!nextId || visited.has(nextId)) break;
         visited.add(nextId);
         const candidate = nodeById.get(nextId);
-        if (candidate && isOntologyNodeActiveAt(candidate, asOf)) {
+        if (candidate && isOntologyNodeActiveAt(candidate, asOf, nodeById)) {
             return candidate.id;
         }
         currId = nextId;
@@ -1522,11 +1683,14 @@ export async function syncAndQueryBrickOntology({
 
     for (const node of workingGraph.nodes) {
         if (!node || (node.kind !== 'brick' && !String(node.id).startsWith('brick:'))) continue;
-        if (isOntologyNodeActiveAt(node, cleanAsOf)) {
+        if (isOntologyNodeActiveAt(node, cleanAsOf, nodeById)) {
             activeBrickNodes.push(node);
         } else {
             const isRetiredAtHorizon = cleanAsOf
-                ? Boolean(node.retiredAt && cleanAsOf >= node.retiredAt)
+                ? Boolean(node.retiredAt && cleanAsOf >= node.retiredAt) ||
+                  (node.isCurrent === false &&
+                      !node.retiredAt &&
+                      (!node.validFrom || node.validFrom <= cleanAsOf))
                 : node.isCurrent === false || Boolean(node.retiredAt);
             if (isRetiredAtHorizon) {
                 let directSupersededBy = node.supersededBy || null;
@@ -1842,7 +2006,7 @@ export async function syncAndQueryBrickOntology({
         if (!prof) continue;
         for (const targetId of prof.governedTargetIds) {
             const targetNode = nodeById.get(targetId);
-            if (!targetNode || !isOntologyNodeActiveAt(targetNode, cleanAsOf)) continue;
+            if (!targetNode || !isOntologyNodeActiveAt(targetNode, cleanAsOf, nodeById)) continue;
             recordImpactEdge({ from: brickNodeId, to: targetId, type: 'GOVERNS' });
             if (!governedRepoMap.has(targetId)) {
                 governedRepoMap.set(targetId, {
@@ -1884,7 +2048,7 @@ export async function syncAndQueryBrickOntology({
             if (!nextRepoId || governedRepoMap.has(nextRepoId)) continue;
 
             const candidate = nodeById.get(nextRepoId);
-            if (!candidate || !isOntologyNodeActiveAt(candidate, cleanAsOf)) continue;
+            if (!candidate || !isOntologyNodeActiveAt(candidate, cleanAsOf, nodeById)) continue;
             if (
                 candidate.kind === 'brick' ||
                 candidate.kind === 'stack' ||
@@ -1947,7 +2111,9 @@ export async function syncAndQueryBrickOntology({
         }))
         .sort((a, b) => a.hop - b.hop || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
-    const activeNodeCount = workingGraph.nodes.filter((n) => isOntologyNodeActiveAt(n, cleanAsOf)).length;
+    const activeNodeCount = workingGraph.nodes.filter((n) =>
+        isOntologyNodeActiveAt(n, cleanAsOf, nodeById)
+    ).length;
 
     const result = {
         namespace: workingGraph.namespace,

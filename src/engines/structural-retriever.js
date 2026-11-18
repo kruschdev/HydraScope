@@ -1229,11 +1229,13 @@ export async function supersedeDecisionInGraph(
     const {
         oldId: cleanOldId,
         newId: cleanNewId,
-        title: cleanTitle,
-        content: cleanContent,
+        title: rawTitle,
+        content: rawContent,
         governsIds: sanitizedGovernsIds,
         effectiveAt: cleanEffectiveAt,
     } = validation.value;
+    const cleanTitle = scrubSensitiveText(rawTitle);
+    const cleanContent = scrubSensitiveText(rawContent);
 
     const dynamicCount = graph.nodes.filter((n) => n?._dynamicSupersede === true).length;
     if (dynamicCount >= MAX_CUSTOM_DECISIONS) {

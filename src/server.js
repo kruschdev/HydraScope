@@ -344,6 +344,90 @@ export async function buildServer({
                 return res;
             },
 
+            'POST /api/ontology/ingest': async (ctx) => {
+                if (!enforceRateLimit(ctx, mutationLimiter, 'hydrascope.brick_ontology.ingest')) return;
+                if (!enforceOptionalAdminBearer(ctx, 'hydrascope.brick_ontology.ingest')) return;
+
+                const rawBody = ctx.body;
+                if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+                    ctx.sendJson(
+                        400,
+                        errorEnvelope(
+                            'INVALID_SNAPSHOT',
+                            'Request body must be a JSON object containing a Brick Exchange snapshot.',
+                            null,
+                            'hydrascope.brick_ontology.ingest'
+                        )
+                    );
+                    return;
+                }
+
+                const hasWrappedSnapshot =
+                    Object.hasOwn(rawBody, 'snapshot') &&
+                    rawBody.snapshot !== null &&
+                    typeof rawBody.snapshot === 'object' &&
+                    !Array.isArray(rawBody.snapshot);
+                const snapshot = hasWrappedSnapshot ? rawBody.snapshot : rawBody;
+                const mergeIntoActiveRepo = rawBody.mergeIntoActiveRepo !== false;
+                const namespace =
+                    typeof rawBody.namespace === 'string' && rawBody.namespace.trim()
+                        ? rawBody.namespace.trim()
+                        : undefined;
+
+                recordBoundedEvent('ontology:ingest');
+                const res = await runtime.ingestBrickOntology(snapshot, {
+                    mergeIntoActiveRepo,
+                    namespace
+                });
+                if (!res.ok) {
+                    ctx.sendJson(400, res);
+                    return;
+                }
+                return res;
+            },
+
+            'POST /api/ontology/query': async (ctx) => {
+                if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.brick_ontology.query')) return;
+                const rawBody = ctx.body && typeof ctx.body === 'object' && !Array.isArray(ctx.body) ? ctx.body : {};
+                const prompt = String(rawBody.query || '').trim();
+                if (prompt.length > MAX_QUERY_CHARS) {
+                    ctx.sendJson(
+                        400,
+                        errorEnvelope(
+                            'QUERY_TOO_LONG',
+                            `Field "query" exceeds ${MAX_QUERY_CHARS} characters.`,
+                            null,
+                            'hydrascope.brick_ontology.query'
+                        )
+                    );
+                    return;
+                }
+
+                recordBoundedEvent(`ontology:query:${(prompt || 'structural').slice(0, 48)}`);
+                const res = await runtime.queryBrickOntology({
+                    snapshot:
+                        rawBody.snapshot && typeof rawBody.snapshot === 'object' && !Array.isArray(rawBody.snapshot)
+                            ? rawBody.snapshot
+                            : null,
+                    mergeIntoActiveRepo: rawBody.mergeIntoActiveRepo !== false,
+                    query: prompt,
+                    targetStack: rawBody.targetStack ? String(rawBody.targetStack).trim() : null,
+                    targetChannel: rawBody.targetChannel ? String(rawBody.targetChannel).trim() : null,
+                    requiredPorts: Array.isArray(rawBody.requiredPorts) ? rawBody.requiredPorts : [],
+                    asOf: rawBody.asOf ? String(rawBody.asOf).trim() : null,
+                    maxHops: Number(rawBody.maxHops) || 2,
+                    namespace:
+                        typeof rawBody.namespace === 'string' && rawBody.namespace.trim()
+                            ? rawBody.namespace.trim()
+                            : undefined
+                });
+                if (!res.ok) {
+                    ctx.sendJson(400, res);
+                    return;
+                }
+                return res;
+            },
+
             'POST /api/stream': (ctx) => {
                 if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.stream')) return;
                 const prompt = String(ctx.body?.prompt || 'ping').trim().slice(0, 240);

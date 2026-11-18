@@ -10,7 +10,13 @@ import {
     surrogateVertexId,
     createHydraOpenCypherClient,
 } from '../src/connectors/hydradb-client.js';
-import { traverseStructuralContext } from '../src/engines/structural-retriever.js';
+import {
+    traverseStructuralContext,
+    supersedeDecisionInGraph,
+} from '../src/engines/structural-retriever.js';
+import { createHydraScopeRuntime } from '../src/runtime.js';
+import { buildServer } from '../src/server.js';
+import { HYDRASCOPE_MCP_TOOLS } from '../src/mcp/hydrascope-mcp.js';
 
 const HASH_STRIPE_INGRESS = 'a11ce000111122223333444455556666777788889999aaaabbbbccccddddeeee';
 const HASH_LEDGER_AUDITOR = 'b22df000111122223333444455556666777788889999aaaabbbbccccddddeeee';
@@ -564,4 +570,339 @@ test('4. Port namespace collision guard (slack:channel_id !== discord:channel_id
     assert.equal(offlineRes.data.mode, 'embedded_graph_fallback');
     assert.equal(offlineRes.data.twoHopCompositions.length, 1);
     assert.equal(JSON.stringify(offlineRes).includes(dynamicLanIp), false);
+});
+
+test('5. Runtime ingestBrickOntology -> queryBrickOntology preserves repo AST downstreamRepoCallers, consistent namespace, and surrogateId SET sync', async () => {
+    const HASH_PARTNER_FEE = '4444444444444444444444444444444444444444444444444444444444444444';
+    const capturedQueries = [];
+    const customNs = 'triad-ontology';
+
+    const mockHydraClient = createHydraOpenCypherClient({
+        baseUrl: 'https://hydradb-test.example.com:8443',
+        token: 'hs-mock-token-123456',
+        namespace: customNs,
+        lookupFn: async () => [{ address: '93.184.216.34', family: 4 }],
+        fetchImpl: async (url, init = {}) => {
+            const parsed = new URL(String(url));
+            if (parsed.pathname === '/healthz') {
+                return new Response(JSON.stringify({ status: 'ok' }), {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                });
+            }
+            const body = init.body ? JSON.parse(String(init.body)) : {};
+            capturedQueries.push(body);
+            return new Response(
+                JSON.stringify({
+                    columns: ['ok'],
+                    rows: [[{ type: 'int', value: 1 }]],
+                    read_epoch: 5,
+                    bookmark: 'sgk:1:triad:5',
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+        },
+    });
+
+    const runtime = await createHydraScopeRuntime({
+        preferOllama: false,
+        hydraNamespace: customNs,
+        hydraClient: mockHydraClient,
+    });
+
+    // Fintech fixture has file:src/billing/fee-engine.ts -> settlement-batch.ts -> sox-reconciler.ts
+    const snapshot = {
+        bricks: [
+            {
+                brickId: 'partner-fee-brick',
+                name: 'Partner Fee Governance Brick',
+                summary: 'Sealed cent-conserving partner fee brick governing fee-engine.ts.',
+                sourceHash: HASH_PARTNER_FEE,
+                governs: ['file:src/billing/fee-engine.ts'],
+                ontology: {
+                    stacks: ['typescript-node'],
+                    consumesPorts: ['ledger_event'],
+                    producesPorts: ['audit_record'],
+                    validFrom: '2026-10-01',
+                },
+            },
+        ],
+    };
+
+    const ingestRes = await runtime.ingestBrickOntology(snapshot);
+    assert.equal(ingestRes.ok, true);
+    assert.equal(ingestRes.data.namespace, customNs);
+
+    // Query WITHOUT passing `snapshot` so runtime queries merged `activeGraph` directly
+    const queryRes = await runtime.queryBrickOntology({
+        query: 'partner-fee-brick calculatePartnerFee',
+        targetStack: 'typescript-node',
+        maxHops: 2,
+    });
+    assert.equal(queryRes.ok, true);
+    assert.equal(queryRes.data.namespace, customNs);
+    assert.equal(queryRes.data.oneHopMatches.length, 1);
+    assert.deepEqual(
+        queryRes.data.governedRepoNodes.map((n) => n.id),
+        ['file:src/billing/fee-engine.ts']
+    );
+
+    const downstreamIds = queryRes.data.downstreamRepoCallers.map((c) => c.id);
+    assert.ok(downstreamIds.includes('file:src/billing/settlement-batch.ts'));
+    assert.ok(downstreamIds.includes('file:src/compliance/sox-reconciler.ts'));
+
+    // Verify WorkspaceRoot uses namespace-scoped surrogateVertexId and mutable props live in SET
+    const expectedRootId = surrogateVertexId(customNs, 'workspace:root');
+    assert.notEqual(expectedRootId, 1000);
+    const nodeMergeCalls = capturedQueries.filter((q) =>
+        String(q.query || '').includes('WorkspaceRoot')
+    );
+    assert.ok(nodeMergeCalls.length > 0);
+    assert.equal(nodeMergeCalls[0].parameters.rootId, expectedRootId);
+    assert.equal(nodeMergeCalls[0].parameters.ns, customNs);
+    assert.ok(
+        String(nodeMergeCalls[0].query).includes(
+            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET '
+        )
+    );
+});
+
+test('6. Un-dated asOf supersession, cross-org :SUPERSEDES isolation, bare brickId guard, ^bricks/ root anchor, and pre-slugification scrubbing', async () => {
+    const HASH_V1 = '1010101010101010101010101010101010101010101010101010101010101010';
+    const HASH_V2 = '2020202020202020202020202020202020202020202020202020202020202020';
+    const HASH_V3 = '3030303030303030303030303030303030303030303030303030303030303030';
+    const HASH_OTHER_ORG = '9090909090909090909090909090909090909090909090909090909090909090';
+
+    // 6a. Un-dated supersession (`v2` has no `validFrom`, so `v1.retiredAt === null` & `v1.isCurrent === false`)
+    // Querying with `asOf` must NOT resurrect `v1`!
+    const undatedSnapshot = {
+        bricks: [
+            {
+                brickId: 'audit-writer',
+                name: 'Audit Writer v1',
+                sourceHash: HASH_V1,
+                orgId: 'org-alpha',
+                ontology: {
+                    stacks: ['node-esm'],
+                    producesPorts: ['audit_record'],
+                    validFrom: '2026-09-01',
+                },
+            },
+            {
+                brickId: 'audit-writer',
+                name: 'Audit Writer v2 (Undated Replacement)',
+                sourceHash: HASH_V2,
+                orgId: 'org-alpha',
+                ontology: {
+                    stacks: ['node-esm'],
+                    producesPorts: ['audit_record'],
+                    supersedes: [HASH_V1],
+                },
+            },
+            // Cross-org brick attempting to supersede org-alpha's HASH_V2 must be blocked!
+            {
+                brickId: 'audit-writer',
+                name: 'Hostile Cross-Org Superseder',
+                sourceHash: HASH_OTHER_ORG,
+                orgId: 'org-intruder',
+                ontology: {
+                    stacks: ['node-esm'],
+                    producesPorts: ['audit_record'],
+                    supersedes: [HASH_V2],
+                },
+            },
+            // Bare `brickId` supersession without `@hash` or 64-hex hash must be ignored (never re-retiring v1 while leaving v2 active)
+            {
+                brickId: 'audit-writer',
+                name: 'Ambiguous Bare Ref v3',
+                sourceHash: HASH_V3,
+                orgId: 'org-alpha',
+                ontology: {
+                    stacks: ['node-esm'],
+                    producesPorts: ['audit_record'],
+                    supersedes: ['audit-writer'],
+                },
+            },
+        ],
+    };
+
+    const undatedAsOfRes = await syncAndQueryBrickOntology({
+        snapshot: undatedSnapshot,
+        targetStack: 'node-esm',
+        asOf: '2026-11-01',
+    });
+    assert.equal(undatedAsOfRes.ok, true);
+
+    const activeIds = undatedAsOfRes.data.oneHopMatches.map((m) => m.id);
+    const v1Id = `brick:audit-writer@${HASH_V1}`;
+    const v2Id = `brick:audit-writer@${HASH_V2}`;
+    assert.equal(activeIds.includes(v1Id), false, 'Un-dated retired v1 must stay inactive at asOf');
+    assert.equal(activeIds.includes(v2Id), true, 'Cross-org supersession must NOT retire org-alpha v2');
+    assert.ok(undatedAsOfRes.data.retiredLineage.some((r) => r.id === v1Id && r.supersededBy === v2Id));
+
+    // 6b. Repo-root anchor (`^bricks/`) & pre-slugification sensitive string scrubbing
+    const sensitiveIp = ['192', '168', '44', '99'].join('.');
+    const sensitivePath = ['', 'home', 'devbox', 'secret-brick'].join('/');
+    const sensitiveSluggedIp = ['192', '168', '44', '99'].join('-');
+
+    const rootAnchorRepo = {
+        workspaceName: 'anchor-check',
+        nodes: [
+            {
+                id: 'file:bricks/audit-writer/index.js',
+                kind: 'code',
+                title: 'bricks/audit-writer/index.js',
+                path: './bricks/audit-writer/index.js',
+                content: 'export const writeAudit = () => true;',
+                tokens: 12,
+                isCurrent: true,
+            },
+            {
+                id: 'file:tests/fixtures/bricks/audit-writer/index.js',
+                kind: 'code',
+                title: 'Nested fixture brick copy',
+                path: 'tests/fixtures/bricks/audit-writer/index.js',
+                content: 'export const fixtureCopy = () => false;',
+                tokens: 12,
+                isCurrent: true,
+            },
+        ],
+        edges: [],
+    };
+
+    const scrubSnap = {
+        orgProfiles: [{ orgId: `org-${sensitiveIp}`, name: `Org at ${sensitivePath}` }],
+        bricks: [
+            {
+                brickId: 'audit-writer',
+                name: 'Audit Writer Root',
+                sourceHash: HASH_V2,
+                ontology: { stacks: ['node-esm'] },
+            },
+            {
+                name: `Leaky Brick ${sensitivePath} ${sensitiveIp}`,
+                sourceHash: '5555555555555555555555555555555555555555555555555555555555555555',
+                ontology: { stacks: ['node-esm'] },
+            },
+        ],
+    };
+
+    const compiledScrub = compileExchangeSnapshotToHydraGraph(scrubSnap);
+    assert.equal(compiledScrub.ok, true);
+    const mergedAnchor = mergeOntologyIntoRepoGraph(rootAnchorRepo, compiledScrub.data);
+    assert.equal(mergedAnchor.ok, true);
+    assert.equal(mergedAnchor.data.governsLinks.length, 1);
+    assert.equal(mergedAnchor.data.governsLinks[0].to, 'file:bricks/audit-writer/index.js');
+
+    const serializedMerged = JSON.stringify(mergedAnchor);
+    assert.equal(serializedMerged.includes(sensitiveIp), false);
+    assert.equal(serializedMerged.includes(sensitiveSluggedIp), false);
+    assert.equal(serializedMerged.includes('devbox'), false);
+
+    // Also verify supersedeDecisionInGraph scrubs sensitive content before storing in graph
+    const decisionGraph = {
+        workspaceName: 'sec-test',
+        nodes: [
+            {
+                id: 'adr:ADR-100',
+                kind: 'decision',
+                title: 'Old Rule',
+                path: 'docs/adr/adr-100.md',
+                content: 'Legacy rule.',
+                tokens: 4,
+                isCurrent: true,
+            },
+        ],
+        edges: [],
+    };
+    const supDecision = await supersedeDecisionInGraph(decisionGraph, {
+        oldId: 'adr:ADR-100',
+        newId: 'adr:ADR-101',
+        title: `Rule on ${sensitiveIp}`,
+        content: `Loaded from ${sensitivePath} on ${sensitiveIp}`,
+        effectiveAt: '2026-11-17',
+    });
+    assert.equal(supDecision.ok, true);
+    assert.equal(JSON.stringify(decisionGraph).includes(sensitiveIp), false);
+    assert.equal(JSON.stringify(decisionGraph).includes('devbox'), false);
+});
+
+test('7. HTTP /api/ontology/ingest and /api/ontology/query routes honor Bearer auth and preserve 6 MCP tools', async (t) => {
+    assert.equal(HYDRASCOPE_MCP_TOOLS.length, 6);
+
+    const adminToken = 'hs-ontology-route-secret';
+    const { server, close } = await buildServer({
+        dbPath: ':memory:',
+        adminToken,
+        runtimeOptions: { preferOllama: false, hydraUrl: '' },
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(async () => {
+        await new Promise((resolve) => server.close(resolve));
+        await close();
+    });
+
+    const { port } = server.address();
+    const base = `http://127.0.0.1:${port}`;
+    const HASH_HTTP_BRICK = '7777777777777777777777777777777777777777777777777777777777777777';
+
+    const ontologyPayload = {
+        snapshot: {
+            bricks: [
+                {
+                    brickId: 'sox-fee-guard',
+                    name: 'SOX Fee Guard Brick',
+                    summary: 'Governs fee-engine.ts partner fee rounding.',
+                    sourceHash: HASH_HTTP_BRICK,
+                    governs: ['file:src/billing/fee-engine.ts'],
+                    ontology: {
+                        stacks: ['typescript-node'],
+                        consumesPorts: ['ledger_event'],
+                        producesPorts: ['audit_record'],
+                        validFrom: '2026-10-15',
+                    },
+                },
+            ],
+        },
+    };
+
+    // Unauthenticated ingest rejected with 401
+    const unauthRes = await fetch(`${base}/api/ontology/ingest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ontologyPayload),
+    });
+    assert.equal(unauthRes.status, 401);
+
+    // Authenticated ingest merges ontology into active FinTech repo graph
+    const ingestRes = await fetch(`${base}/api/ontology/ingest`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
+        },
+        body: JSON.stringify(ontologyPayload),
+    });
+    assert.equal(ingestRes.status, 200);
+    const ingestJson = await ingestRes.json();
+    assert.equal(ingestJson.ok, true);
+
+    // Query route preserves repo AST downstream callers (`settlement-batch.ts` + `sox-reconciler.ts`)
+    const queryRes = await fetch(`${base}/api/ontology/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            query: 'sox-fee-guard',
+            targetStack: 'typescript-node',
+            maxHops: 2,
+        }),
+    });
+    assert.equal(queryRes.status, 200);
+    const queryJson = await queryRes.json();
+    assert.equal(queryJson.ok, true);
+    assert.equal(queryJson.data.oneHopMatches.length, 1);
+    const callerIds = queryJson.data.downstreamRepoCallers.map((c) => c.id);
+    assert.ok(callerIds.includes('file:src/billing/settlement-batch.ts'));
+    assert.ok(callerIds.includes('file:src/compliance/sox-reconciler.ts'));
 });

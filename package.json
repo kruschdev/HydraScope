@@ -31,10 +31,12 @@
   },
   "dependencies": {
     "@hydradb/selfgraph": "file:vendor/hydradb-selfgraph-0.2.1.tgz",
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/52468273234fa5f9447e72dfee1c82412c933c64.tar.gz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/ebe08720fc765520737ba4edc5c4fcd9c2420e93.tar.gz",
     "kuzu": "^0.11.3"
   },
   "overrides": {
+    "hono": "^4.13.19",
+    "@hono/node-server": "^2.1.9",
     "tar": "^7.5.21",
     "uuid": "^11.1.1"
   }

@@ -9,12 +9,18 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/52468273234fa5f9447e72dfee1c82412c933c64.tar.gz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/ebe08720fc765520737ba4edc5c4fcd9c2420e93.tar.gz",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.0",
     "vite": "^6.0.0"
+  },
+  "overrides": {
+    "hono": "^4.13.19",
+    "@hono/node-server": "^2.1.9",
+    "tar": "^7.5.21",
+    "uuid": "^11.1.1"
   }
 }

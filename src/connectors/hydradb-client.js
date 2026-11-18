@@ -623,21 +623,27 @@ export function createHydraOpenCypherClient(options = {}) {
         const safeNodes = Array.isArray(nodes) ? nodes : [];
         const safeEdges = Array.isArray(edges) ? edges : [];
 
-        const nodeCypher =
-            'MERGE (root:WorkspaceRoot {id: 1000, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, logicalId: $logicalId, kind: $kind, title: $title, path: $path, isCurrent: $isCurrent})';
+        const rootVertexId = surrogateVertexId(safeNamespace, 'workspace:root');
+        const baseNodeCypher =
+            'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET n.logicalId = $logicalId, n.kind = $kind, n.title = $title, n.path = $path, n.isCurrent = $isCurrent';
 
         const vertexIdByLogicalId = new Map();
         const nodeOps = [];
+        const nodeCypherSet = new Set();
         for (const rawNode of safeNodes) {
             if (!rawNode || typeof rawNode !== 'object') continue;
             const logicalId = String(rawNode.logicalId ?? rawNode.id ?? '').trim();
             if (!logicalId) continue;
             const vertexId =
-                Number.isSafeInteger(rawNode.vertexId) &&
-                rawNode.vertexId >= 1000 &&
-                rawNode.vertexId <= 9007199254740000
-                    ? rawNode.vertexId
-                    : surrogateVertexId(safeNamespace, logicalId);
+                Number.isSafeInteger(rawNode.surrogateId) &&
+                rawNode.surrogateId >= 1000 &&
+                rawNode.surrogateId <= Number.MAX_SAFE_INTEGER
+                    ? rawNode.surrogateId
+                    : Number.isSafeInteger(rawNode.vertexId) &&
+                        rawNode.vertexId >= 1000 &&
+                        rawNode.vertexId <= Number.MAX_SAFE_INTEGER
+                      ? rawNode.vertexId
+                      : surrogateVertexId(safeNamespace, logicalId);
             vertexIdByLogicalId.set(logicalId, vertexId);
             const kind = String(rawNode.kind ?? rawNode.type ?? rawNode.label ?? 'Artifact').trim() || 'Artifact';
             const title = String(rawNode.title ?? rawNode.name ?? logicalId).trim() || logicalId;
@@ -645,17 +651,55 @@ export function createHydraOpenCypherClient(options = {}) {
             const isCurrent =
                 typeof rawNode.isCurrent === 'boolean' ? rawNode.isCurrent : !rawNode.retiredAt;
 
+            const setClauses = [
+                'n.logicalId = $logicalId',
+                'n.kind = $kind',
+                'n.title = $title',
+                'n.path = $path',
+                'n.isCurrent = $isCurrent',
+            ];
+            /** @type {Record<string, unknown>} */
+            const parameters = {
+                rootId: rootVertexId,
+                ns: safeNamespace,
+                id: vertexId,
+                logicalId,
+                kind,
+                title,
+                path: nodePath,
+                isCurrent,
+            };
+
+            const summaryText =
+                typeof rawNode.summary === 'string' && rawNode.summary.trim()
+                    ? rawNode.summary.trim()
+                    : '';
+            if (summaryText) {
+                setClauses.push('n.summary = $summary');
+                parameters.summary = summaryText;
+            }
+            const retiredAtText =
+                typeof rawNode.retiredAt === 'string' && rawNode.retiredAt.trim()
+                    ? rawNode.retiredAt.trim()
+                    : '';
+            if (retiredAtText) {
+                setClauses.push('n.retiredAt = $retiredAt');
+                parameters.retiredAt = retiredAtText;
+            }
+            const supersededByText =
+                typeof rawNode.supersededBy === 'string' && rawNode.supersededBy.trim()
+                    ? rawNode.supersededBy.trim()
+                    : '';
+            if (supersededByText) {
+                setClauses.push('n.supersededBy = $supersededBy');
+                parameters.supersededBy = supersededByText;
+            }
+
+            const statementCypher = `MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns}) SET ${setClauses.join(', ')}`;
+            nodeCypherSet.add(statementCypher);
             nodeOps.push({
-                cypher: nodeCypher,
-                parameters: {
-                    ns: safeNamespace,
-                    id: vertexId,
-                    logicalId,
-                    kind,
-                    title,
-                    path: nodePath,
-                    isCurrent,
-                },
+                cypher: statementCypher,
+                parameters,
             });
         }
 
@@ -676,8 +720,9 @@ export function createHydraOpenCypherClient(options = {}) {
             distinctEdgeTypes.add(safeType);
 
             edgeOps.push({
-                cypher: `MERGE (a:GraphNode {id: $fromId, logicalId: $fromLogicalId})-[:${safeType}]->(b:GraphNode {id: $toId, logicalId: $toLogicalId})`,
+                cypher: `MERGE (a:GraphNode {id: $fromId, namespace: $ns})-[:${safeType}]->(b:GraphNode {id: $toId, namespace: $ns}) SET a.logicalId = $fromLogicalId, b.logicalId = $toLogicalId`,
                 parameters: {
+                    ns: safeNamespace,
                     fromId:
                         vertexIdByLogicalId.get(fromLogicalId) ??
                         surrogateVertexId(safeNamespace, fromLogicalId),
@@ -691,10 +736,10 @@ export function createHydraOpenCypherClient(options = {}) {
         }
 
         const cypherStatements = [
-            ...(nodeOps.length > 0 ? [nodeCypher] : []),
+            ...(nodeOps.length > 0 ? [...(nodeCypherSet.size > 0 ? nodeCypherSet : [baseNodeCypher])] : []),
             ...[...distinctEdgeTypes].map(
                 (t) =>
-                    `MERGE (a:GraphNode {id: $fromId, logicalId: $fromLogicalId})-[:${t}]->(b:GraphNode {id: $toId, logicalId: $toLogicalId})`
+                    `MERGE (a:GraphNode {id: $fromId, namespace: $ns})-[:${t}]->(b:GraphNode {id: $toId, namespace: $ns}) SET a.logicalId = $fromLogicalId, b.logicalId = $toLogicalId`
             ),
         ];
 

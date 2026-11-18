@@ -45,6 +45,8 @@ export async function createHydraScopeRuntime(options = {}) {
         // Optional WASM runtime unavailable; repo-compiler falls back deterministically.
     }
 
+    const runtimeNamespace = options.hydraNamespace || config.hydraNamespace || 'brick-ontology';
+
     const hydraClient =
         options.hydraClient ||
         createHydraOpenCypherClient({
@@ -52,7 +54,7 @@ export async function createHydraScopeRuntime(options = {}) {
             token: options.hydraToken ?? config.hydraToken,
             graphId: options.hydraGraphId ?? config.hydraGraphId,
             cellId: options.hydraCellId ?? config.hydraCellId,
-            namespace: options.hydraNamespace ?? config.hydraNamespace,
+            namespace: runtimeNamespace,
             allowPrivateLan: options.hydraAllowLan ?? config.hydraAllowLan,
             allowTailscale: options.hydraAllowTailscale ?? config.hydraAllowTailscale,
             timeoutMs: options.timeoutMs ?? 2500
@@ -444,7 +446,7 @@ export async function createHydraScopeRuntime(options = {}) {
 
     function ingestBrickOntology(snapshot = {}, { mergeIntoActiveRepo = true, namespace } = {}) {
         return withMutationLock(async () => {
-            const targetNamespace = namespace || config.hydraNamespace || 'brick-ontology';
+            const targetNamespace = namespace || runtimeNamespace;
             const compiled = compileExchangeSnapshotToHydraGraph(snapshot, {
                 workspaceName: activeGraph?.workspaceName || 'brick-exchange-ontology',
                 namespace: targetNamespace
@@ -479,6 +481,7 @@ export async function createHydraScopeRuntime(options = {}) {
                     `Ingested brick ontology into ${activeGraph.workspaceName} (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} edges).`,
                     {
                         workspaceName: activeGraph.workspaceName,
+                        namespace: activeGraph.namespace || targetNamespace,
                         nodeCount: activeGraph.nodes.length,
                         edgeCount: activeGraph.edges.length,
                         lastSync
@@ -490,6 +493,7 @@ export async function createHydraScopeRuntime(options = {}) {
 
     async function queryBrickOntology({
         snapshot = null,
+        mergeIntoActiveRepo = true,
         query = '',
         targetStack = null,
         targetChannel = null,
@@ -498,10 +502,11 @@ export async function createHydraScopeRuntime(options = {}) {
         maxHops = 2,
         namespace
     } = {}) {
-        const targetNamespace = namespace || config.hydraNamespace || 'brick-ontology';
+        const targetNamespace =
+            namespace || (!snapshot && activeGraph?.namespace ? activeGraph.namespace : runtimeNamespace);
         return syncAndQueryBrickOntology({
             snapshot: snapshot || activeGraph,
-            baseRepoGraph: snapshot ? activeGraph : null,
+            baseRepoGraph: mergeIntoActiveRepo ? activeGraph : null,
             query,
             targetStack,
             targetChannel,
