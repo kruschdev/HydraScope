@@ -18,7 +18,11 @@
   "files": [
     "bin",
     "src",
-    "client",
+    "client/src",
+    "client/public",
+    "client/index.html",
+    "client/package.json",
+    "client/vite.config.js",
     "config.json",
     "Dockerfile",
     "docker-compose.yml",
@@ -45,11 +49,8 @@
     "build": "npm --prefix client run build",
     "test": "NODE_ENV=test node --test tests/*.test.js"
   },
-  "bundleDependencies": [
-    "@hydradb/selfgraph"
-  ],
   "dependencies": {
-    "@hydradb/selfgraph": "file:vendor/hydradb-selfgraph-0.2.1.tgz",
+    "@hydradb/selfgraph": "https://raw.githubusercontent.com/kruschdev/HydraScope/main/vendor/hydradb-selfgraph-0.2.1.tgz",
     "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/b22f25c34e000bada54e681ccfafc13a05409261.tar.gz",
     "kuzu": "^0.11.3"
   },
