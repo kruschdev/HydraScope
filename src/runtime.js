@@ -20,6 +20,11 @@ import {
     runAgentContextContinualEval,
     runHydraLoadBenchmark
 } from './engines/agent-context-layer.js';
+import {
+    compileExchangeSnapshotToHydraGraph,
+    mergeOntologyIntoRepoGraph,
+    syncAndQueryBrickOntology
+} from './engines/brick-ontology-bridge.js';
 import { scrubSensitiveStrings } from './utils/scrubber.js';
 import { buildDynamicScenariosForGraph } from './utils/validation.js';
 
@@ -437,6 +442,77 @@ export async function createHydraScopeRuntime(options = {}) {
         }
     }
 
+    function ingestBrickOntology(snapshot = {}, { mergeIntoActiveRepo = true, namespace } = {}) {
+        return withMutationLock(async () => {
+            const targetNamespace = namespace || config.hydraNamespace || 'brick-ontology';
+            const compiled = compileExchangeSnapshotToHydraGraph(snapshot, {
+                workspaceName: activeGraph?.workspaceName || 'brick-exchange-ontology',
+                namespace: targetNamespace
+            });
+            if (!compiled.ok) return scrubSensitiveStrings(compiled);
+
+            let nextGraph = compiled.data;
+            if (mergeIntoActiveRepo && activeGraph) {
+                const merged = mergeOntologyIntoRepoGraph(activeGraph, compiled.data);
+                if (!merged.ok) return scrubSensitiveStrings(merged);
+                nextGraph = merged.data;
+            }
+
+            if (hydraClient.isConfigured()) {
+                const syncRes = await hydraClient.syncGraphSnapshot({
+                    nodes: nextGraph.nodes,
+                    edges: nextGraph.edges
+                });
+                if (syncRes.ok) lastSync = syncRes.data;
+            }
+
+            vectorIndex = await buildVectorIndex(nextGraph, {
+                preferOllama,
+                ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
+                model: options.embedModel ?? config.embedModel
+            });
+            activeGraph = nextGraph;
+
+            return scrubSensitiveStrings(
+                okEnvelope(
+                    'hydrascope.brick_ontology.ingest',
+                    `Ingested brick ontology into ${activeGraph.workspaceName} (${activeGraph.nodes.length} nodes, ${activeGraph.edges.length} edges).`,
+                    {
+                        workspaceName: activeGraph.workspaceName,
+                        nodeCount: activeGraph.nodes.length,
+                        edgeCount: activeGraph.edges.length,
+                        lastSync
+                    }
+                )
+            );
+        });
+    }
+
+    async function queryBrickOntology({
+        snapshot = null,
+        query = '',
+        targetStack = null,
+        targetChannel = null,
+        requiredPorts = [],
+        asOf = null,
+        maxHops = 2,
+        namespace
+    } = {}) {
+        const targetNamespace = namespace || config.hydraNamespace || 'brick-ontology';
+        return syncAndQueryBrickOntology({
+            snapshot: snapshot || activeGraph,
+            baseRepoGraph: snapshot ? activeGraph : null,
+            query,
+            targetStack,
+            targetChannel,
+            requiredPorts,
+            asOf,
+            maxHops,
+            hydraClient,
+            namespace: targetNamespace
+        });
+    }
+
     return Object.freeze({
         getGraph: () => activeGraph,
         getState,
@@ -448,6 +524,8 @@ export async function createHydraScopeRuntime(options = {}) {
         runLoadTest,
         supersedeDecision,
         ingestDirectory,
+        ingestBrickOntology,
+        queryBrickOntology,
         selfGraphStatus,
         selfGraphRetrieve,
         selfGraphDiff,
