@@ -1,6 +1,6 @@
 {
   "name": "hydrascope",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "HydraScope: Live Agent Context Layer (Skills, 64 MCP Tools, Resolved Entities & Code AST) Built on Self-Hosted HydraDB",
   "author": "kruschdev <kruschdev@users.noreply.github.com>",
@@ -30,7 +30,8 @@
     "INSTALL.md",
     "spec.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "server.json"
   ],
   "bin": {
     "hydrascope": "./bin/hydrascope.js",
@@ -59,5 +60,6 @@
     "@hono/node-server": "^2.1.9",
     "tar": "^7.5.21",
     "uuid": "^11.1.1"
-  }
+  },
+  "mcpName": "dev.krusch/hydrascope"
 }

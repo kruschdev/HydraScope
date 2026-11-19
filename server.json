@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "dev.krusch/hydrascope",
+  "title": "HydraScope MCP",
+  "description": "Structural graph context, temporal SUPERSEDES lineage, and 4-axis ontology MCP on HydraDB.",
+  "repository": {
+    "url": "https://github.com/kruschdev/HydraScope",
+    "source": "github"
+  },
+  "version": "0.1.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "hydrascope",
+      "version": "0.1.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "mcp"
+        }
+      ]
+    }
+  ]
+}
