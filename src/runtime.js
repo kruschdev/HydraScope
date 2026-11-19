@@ -25,6 +25,11 @@ import {
     mergeOntologyIntoRepoGraph,
     syncAndQueryBrickOntology
 } from './engines/brick-ontology-bridge.js';
+import {
+    compileMetricPropagationGraph,
+    traverseImpactedSurfaceSlots,
+    syncMetricGraphToHydra
+} from './engines/portfolio-metric-graph.js';
 import { scrubSensitiveStrings } from './utils/scrubber.js';
 import { buildDynamicScenariosForGraph } from './utils/validation.js';
 
@@ -518,6 +523,52 @@ export async function createHydraScopeRuntime(options = {}) {
         });
     }
 
+    async function syncMetricGraph(input = {}, { verifyMetricKeys = [] } = {}) {
+        return withMutationLock(async () => {
+            const targetNamespace = input.namespace || 'portfolio-telemetry';
+            const compiled = compileMetricPropagationGraph({
+                ...input,
+                namespace: targetNamespace
+            });
+            if (!compiled.ok) return scrubSensitiveStrings(compiled);
+
+            const scopedClient =
+                targetNamespace === runtimeNamespace
+                    ? hydraClient
+                    : createHydraOpenCypherClient({
+                          baseUrl: options.hydraUrl ?? config.hydraUrl,
+                          token: options.hydraToken ?? config.hydraToken,
+                          graphId: options.hydraGraphId ?? config.hydraGraphId,
+                          cellId: options.hydraCellId ?? config.hydraCellId,
+                          namespace: targetNamespace,
+                          allowPrivateLan: options.hydraAllowLan ?? config.hydraAllowLan,
+                          allowTailscale: options.hydraAllowTailscale ?? config.hydraAllowTailscale,
+                          timeoutMs: options.timeoutMs ?? 2500
+                      });
+
+            const syncRes = await syncMetricGraphToHydra(compiled.data, scopedClient, {
+                verifyMetricKeys:
+                    verifyMetricKeys.length > 0 ? verifyMetricKeys : compiled.data.changedMetricKeys
+            });
+            const impact = traverseImpactedSurfaceSlots(
+                compiled.data,
+                verifyMetricKeys.length > 0 ? verifyMetricKeys : compiled.data.changedMetricKeys
+            );
+
+            return scrubSensitiveStrings(
+                okEnvelope(
+                    'hydrascope.metric_graph.sync',
+                    `Compiled & synced metric graph (${compiled.data.nodes.length} nodes, ${compiled.data.edges.length} edges, ${impact.impactedSlots.length} impacted slots)`,
+                    {
+                        compiled: compiled.data,
+                        impact,
+                        hydraSync: syncRes.ok ? syncRes.data : syncRes
+                    }
+                )
+            );
+        });
+    }
+
     return Object.freeze({
         getGraph: () => activeGraph,
         getState,
@@ -531,6 +582,7 @@ export async function createHydraScopeRuntime(options = {}) {
         ingestDirectory,
         ingestBrickOntology,
         queryBrickOntology,
+        syncMetricGraph,
         selfGraphStatus,
         selfGraphRetrieve,
         selfGraphDiff,
