@@ -9,6 +9,7 @@ import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveText } from '../utils/scrubber.js';
 import {
     isValidIsoDate,
+    normalizeIsoDateOrTimestamp,
     validateOptionalAsOf,
     validateSupersedePayload,
     MAX_CUSTOM_DECISIONS,
@@ -318,11 +319,23 @@ function buildOntologyIndex(graph) {
  */
 export function isNodeActiveAt(node, asOf = null) {
     if (!node || typeof node !== 'object') return false;
-    const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
-    if (!cleanAsOf || !isValidIsoDate(cleanAsOf)) {
-        return node.isCurrent !== false && !node.retiredAt;
+    const asOfCheck = validateOptionalAsOf(asOf);
+    const cleanAsOf = asOfCheck.ok ? asOfCheck.value : null;
+    const validFrom = normalizeIsoDateOrTimestamp(node.validFrom);
+    const retiredAt = normalizeIsoDateOrTimestamp(node.retiredAt);
+    if (!cleanAsOf) {
+        return node.isCurrent !== false && !retiredAt;
     }
-    return (!node.validFrom || node.validFrom <= cleanAsOf) && (!node.retiredAt || node.retiredAt > cleanAsOf);
+    if (validFrom && validFrom > cleanAsOf) {
+        return false;
+    }
+    if (retiredAt) {
+        return retiredAt > cleanAsOf;
+    }
+    if (node.isCurrent === false) {
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -639,7 +652,8 @@ function selectSeedNodes(graph, query, idx) {
  * active member(s) at `asOf` vs retired predecessors (`retiredAt <= asOf` or `!asOf && !active`).
  */
 function resolveSupersedesComponent(startNodeId, nodeById, edges, asOf) {
-    const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
+    const asOfCheck = validateOptionalAsOf(asOf);
+    const cleanAsOf = asOfCheck.ok ? asOfCheck.value : null;
     const componentIds = new Set();
     const queue = [startNodeId];
     const usedSupersedesEdges = [];
@@ -675,9 +689,14 @@ function resolveSupersedesComponent(startNodeId, nodeById, edges, asOf) {
         if (isNodeActiveAt(member, cleanAsOf)) {
             activeMembers.push(member);
         } else {
+            const memberValidFrom = normalizeIsoDateOrTimestamp(member.validFrom);
+            const memberRetiredAt = normalizeIsoDateOrTimestamp(member.retiredAt);
             const retiredByDate = cleanAsOf
-                ? Boolean(member.retiredAt && member.retiredAt <= cleanAsOf)
-                : (member.isCurrent === false || Boolean(member.retiredAt));
+                ? Boolean(memberRetiredAt && memberRetiredAt <= cleanAsOf) ||
+                  (member.isCurrent === false &&
+                      !memberRetiredAt &&
+                      (!memberValidFrom || memberValidFrom <= cleanAsOf))
+                : (member.isCurrent === false || Boolean(memberRetiredAt));
             if (retiredByDate) {
                 let supersededBy = member.supersededBy || null;
                 if (!supersededBy) {
@@ -689,7 +708,7 @@ function resolveSupersedesComponent(startNodeId, nodeById, edges, asOf) {
                     kind: member.kind || 'decision',
                     title: member.title || member.id,
                     path: member.path || null,
-                    retiredAt: member.retiredAt || null,
+                    retiredAt: memberRetiredAt || null,
                     supersededBy,
                 });
             }

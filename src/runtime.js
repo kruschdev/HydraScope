@@ -50,7 +50,14 @@ export async function createHydraScopeRuntime(options = {}) {
         // Optional WASM runtime unavailable; repo-compiler falls back deterministically.
     }
 
-    const runtimeNamespace = options.hydraNamespace || config.hydraNamespace || 'brick-ontology';
+    const runtimeNamespace =
+        options.hydraNamespace ||
+        config.hydraNamespace ||
+        (options.hydraClient &&
+        typeof options.hydraClient.namespace === 'string' &&
+        options.hydraClient.namespace.trim()
+            ? options.hydraClient.namespace.trim()
+            : 'brick-ontology');
 
     const hydraClient =
         options.hydraClient ||
@@ -68,6 +75,7 @@ export async function createHydraScopeRuntime(options = {}) {
     let activeGraph = compileArtifactsToGraph(FINTECH_BENCHMARK_CORPUS, {
         workspaceName: 'fintech-core'
     });
+    let baseRepoGraph = activeGraph;
     let activeScenarios = BENCHMARK_SCENARIOS.slice();
 
     let lastSync = { liveSynced: false, mode: 'embedded_graph_fallback' };
@@ -253,6 +261,7 @@ export async function createHydraScopeRuntime(options = {}) {
                 ollamaHost: options.ollamaEmbedHost ?? config.ollamaEmbedHost,
                 model: options.embedModel ?? config.embedModel
             });
+            baseRepoGraph = activeGraph;
             if (selfGraphAdapter) {
                 for (const targetId of governsIds) {
                     await selfGraphAdapter.recordActiveRule({
@@ -288,6 +297,7 @@ export async function createHydraScopeRuntime(options = {}) {
                     model: options.embedModel ?? config.embedModel
                 });
                 activeGraph = nextGraph;
+                baseRepoGraph = nextGraph;
                 activeScenarios = nextScenarios;
                 vectorIndex = nextVectorIndex;
 
@@ -388,6 +398,7 @@ export async function createHydraScopeRuntime(options = {}) {
             });
 
             activeGraph = nextGraph;
+            baseRepoGraph = nextGraph;
             activeScenarios = nextScenarios;
             vectorIndex = nextVectorIndex;
 
@@ -459,8 +470,10 @@ export async function createHydraScopeRuntime(options = {}) {
             if (!compiled.ok) return scrubSensitiveStrings(compiled);
 
             let nextGraph = compiled.data;
-            if (mergeIntoActiveRepo && activeGraph) {
-                const merged = mergeOntologyIntoRepoGraph(activeGraph, compiled.data);
+            if (mergeIntoActiveRepo && baseRepoGraph) {
+                const merged = mergeOntologyIntoRepoGraph(baseRepoGraph, compiled.data, {
+                    namespace: targetNamespace
+                });
                 if (!merged.ok) return scrubSensitiveStrings(merged);
                 nextGraph = merged.data;
             }
@@ -468,7 +481,8 @@ export async function createHydraScopeRuntime(options = {}) {
             if (hydraClient.isConfigured()) {
                 const syncRes = await hydraClient.syncGraphSnapshot({
                     nodes: nextGraph.nodes,
-                    edges: nextGraph.edges
+                    edges: nextGraph.edges,
+                    namespace: targetNamespace
                 });
                 if (syncRes.ok) lastSync = syncRes.data;
             }
@@ -509,9 +523,9 @@ export async function createHydraScopeRuntime(options = {}) {
     } = {}) {
         const targetNamespace =
             namespace || (!snapshot && activeGraph?.namespace ? activeGraph.namespace : runtimeNamespace);
-        return syncAndQueryBrickOntology({
+        const res = await syncAndQueryBrickOntology({
             snapshot: snapshot || activeGraph,
-            baseRepoGraph: mergeIntoActiveRepo ? activeGraph : null,
+            baseRepoGraph: mergeIntoActiveRepo ? baseRepoGraph : null,
             query,
             targetStack,
             targetChannel,
@@ -519,8 +533,10 @@ export async function createHydraScopeRuntime(options = {}) {
             asOf,
             maxHops,
             hydraClient,
-            namespace: targetNamespace
+            namespace: targetNamespace,
+            syncToHydra: false
         });
+        return scrubSensitiveStrings(res);
     }
 
     async function syncMetricGraph(input = {}, { verifyMetricKeys = [] } = {}) {

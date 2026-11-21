@@ -15,6 +15,7 @@ import { setupLogging } from '@krusch/toolkit/log';
 import { config } from './config.js';
 import { createHydraScopeRuntime } from './runtime.js';
 import { MAX_QUERY_CHARS } from './utils/validation.js';
+import { FORBIDDEN_OBJECT_KEYS } from './utils/scrubber.js';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(MODULE_DIR, '..');
@@ -389,6 +390,25 @@ export async function buildServer({
             'POST /api/ontology/query': async (ctx) => {
                 if (!enforceRateLimit(ctx, readLimiter, 'hydrascope.brick_ontology.query')) return;
                 const rawBody = ctx.body && typeof ctx.body === 'object' && !Array.isArray(ctx.body) ? ctx.body : {};
+                for (const key of Object.keys(rawBody)) {
+                    if (FORBIDDEN_OBJECT_KEYS.has(key)) {
+                        ctx.sendJson(
+                            400,
+                            errorEnvelope(
+                                'ONTOLOGY_FORBIDDEN_KEY',
+                                `Forbidden prototype key "${key}" rejected on ontology query.`,
+                                null,
+                                'hydrascope.brick_ontology.query'
+                            )
+                        );
+                        return;
+                    }
+                }
+                const hasInlineSnapshot =
+                    rawBody.snapshot && typeof rawBody.snapshot === 'object' && !Array.isArray(rawBody.snapshot);
+                if (hasInlineSnapshot && !enforceOptionalAdminBearer(ctx, 'hydrascope.brick_ontology.query')) {
+                    return;
+                }
                 const prompt = String(rawBody.query || '').trim();
                 if (prompt.length > MAX_QUERY_CHARS) {
                     ctx.sendJson(

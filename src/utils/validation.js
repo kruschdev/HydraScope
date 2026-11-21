@@ -7,6 +7,8 @@
 import { FORBIDDEN_OBJECT_KEYS } from './scrubber.js';
 
 const ISO_DATE_RE = /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/;
+const ISO_DATETIME_RE =
+    /^(\d{4}-\d{2}-\d{2})T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.(\d{1,9}))?)?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/i;
 const SAFE_NODE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_:./-]{0,127}$/;
 
 export const MAX_CUSTOM_DECISIONS = 32;
@@ -39,27 +41,65 @@ export function isValidIsoDate(rawDate) {
 }
 
 /**
+ * Normalize either a strict `YYYY-MM-DD` date or a full ISO-8601 timestamp (`Z` or `+-HH:MM`)
+ * into a canonical UTC `YYYY-MM-DD` calendar date, returning `null` for invalid inputs.
+ *
+ * @param {unknown} rawDate - Candidate date or ISO-8601 timestamp string
+ * @returns {string | null}
+ */
+export function normalizeIsoDateOrTimestamp(rawDate) {
+    if (typeof rawDate !== 'string') return null;
+    const trimmed = rawDate.trim();
+    if (!trimmed) return null;
+    if (isValidIsoDate(trimmed)) {
+        return trimmed;
+    }
+    const dtMatch = ISO_DATETIME_RE.exec(trimmed);
+    if (!dtMatch) return null;
+    const localDatePart = dtMatch[1];
+    if (!isValidIsoDate(localDatePart)) return null;
+    const hh = dtMatch[2];
+    const mm = dtMatch[3];
+    const ss = dtMatch[4] || '00';
+    const msFrac = dtMatch[5] ? `.${dtMatch[5].slice(0, 3).padEnd(3, '0')}` : '';
+    const tz = dtMatch[6].toUpperCase();
+    const canonicalIso = `${localDatePart}T${hh}:${mm}:${ss}${msFrac}${tz}`;
+    const parsedMs = Date.parse(canonicalIso);
+    if (!Number.isFinite(parsedMs)) return null;
+    return new Date(parsedMs).toISOString().slice(0, 10);
+}
+
+/**
  * Normalize an optional `asOf` parameter: returns `{ ok: true, value: string|null }` or `{ ok: false, message }`.
  *
- * @param {unknown} rawAsOf - Optional ISO date string
+ * @param {unknown} rawAsOf - Optional ISO date or ISO-8601 timestamp string
  * @returns {{ ok: true, value: string | null } | { ok: false, code: string, message: string }}
  */
 export function validateOptionalAsOf(rawAsOf) {
     if (rawAsOf === null || rawAsOf === undefined) {
         return { ok: true, value: null };
     }
-    const trimmed = String(rawAsOf).trim();
-    if (!trimmed) {
-        return { ok: true, value: null };
-    }
-    if (!isValidIsoDate(trimmed)) {
+    if (typeof rawAsOf !== 'string') {
         return {
             ok: false,
             code: 'INVALID_DATE',
-            message: `Invalid asOf date "${trimmed.slice(0, 40)}". Expected valid calendar date in YYYY-MM-DD format.`
+            message:
+                'Invalid asOf date. Expected valid calendar date in YYYY-MM-DD or ISO-8601 timestamp format.'
         };
     }
-    return { ok: true, value: trimmed };
+    const trimmed = rawAsOf.trim();
+    if (!trimmed) {
+        return { ok: true, value: null };
+    }
+    const normalized = normalizeIsoDateOrTimestamp(trimmed);
+    if (!normalized) {
+        return {
+            ok: false,
+            code: 'INVALID_DATE',
+            message: `Invalid asOf date "${trimmed.slice(0, 40)}". Expected valid calendar date in YYYY-MM-DD or ISO-8601 timestamp format.`
+        };
+    }
+    return { ok: true, value: normalized };
 }
 
 /**

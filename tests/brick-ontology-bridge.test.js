@@ -911,4 +911,121 @@ test('7. HTTP /api/ontology/ingest and /api/ontology/query routes honor Bearer a
     const mcpInstance = createHydraScopeMcp({ runtime, connect: false });
     assert.equal(HYDRASCOPE_MCP_TOOLS.length, 6);
     assert.ok(mcpInstance);
+
+    // SEC-03: Unauthenticated inline snapshot on POST /api/ontology/query is rejected (401) when admin token is configured
+    const unauthInlineSnap = await fetch(`${base}/api/ontology/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            query: 'poison-attempt',
+            snapshot: ontologyPayload.snapshot,
+        }),
+    });
+    assert.equal(unauthInlineSnap.status, 401);
+});
+
+test('8. Wave 10.1 Hardening: query-only no-sync, clean re-ingest, 512-brick cap, UTC asOf, signed ontology precedence, scrubber boundaries, and 48-bit Edge SHA-256 parity', async () => {
+    const { surrogateVertexId: edgeSurrogateVertexId } = await import('../src/edge/edge-shims-hydradb.js');
+    const { scrubSensitiveText } = await import('../src/utils/scrubber.js');
+
+    // DOC-01: Edge shim matches Node 48-bit SHA-256 surrogateVertexId bit-for-bit
+    for (const [ns, id] of [
+        ['brick-ontology', 'brick:partner-fee'],
+        ['default', 'workspace:root'],
+        ['triad-ontology', 'port:ledger_event'],
+    ]) {
+        assert.equal(edgeSurrogateVertexId(ns, id), surrogateVertexId(ns, id));
+    }
+
+    // ARCH-03: Scrubber catches underscore-prefixed private IPs/tokens while preserving repo relative /root paths
+    const dynIp = [192, 168, 1, 240].join('.');
+    const scrubbedUnderscore = scrubSensitiveText(`host_${dynIp} key_hdb_abcdefghijkl1234`);
+    assert.equal(scrubbedUnderscore.includes(dynIp), false);
+    assert.equal(scrubbedUnderscore.includes('hdb_abcdefghijkl1234'), false);
+    assert.equal(scrubSensitiveText('file:src/root_helper.js'), 'file:src/root_helper.js');
+
+    // SEC-03 & ARCH-03: runtime.queryBrickOntology executes 0 live syncGraphSnapshot calls, and re-ingest drops removed bricks
+    let syncCallCount = 0;
+    const countingClient = {
+        namespace: 'triad-check',
+        isConfigured: () => true,
+        async syncGraphSnapshot() {
+            syncCallCount += 1;
+            return {
+                ok: true,
+                data: { liveSynced: true, mode: 'hydradb_opencypher_live', nodesWritten: 1, edgesWritten: 1 },
+            };
+        },
+    };
+    const rt = await createHydraScopeRuntime({
+        preferOllama: false,
+        hydraClient: countingClient,
+    });
+    const syncAfterBoot = syncCallCount;
+
+    const hashA = 'a'.repeat(64);
+    const hashB = 'b'.repeat(64);
+    await rt.ingestBrickOntology({
+        bricks: [{ brickId: 'ephemeral-alpha', orgId: 'org-a', sourceHash: hashA, ontology: { stacks: ['node-esm'] } }],
+    });
+    const syncAfterIngest1 = syncCallCount;
+    assert.equal(syncAfterIngest1, syncAfterBoot + 1);
+
+    const q1 = await rt.queryBrickOntology({ query: 'ephemeral-alpha', targetStack: 'node-esm' });
+    assert.equal(q1.ok, true);
+    assert.equal(q1.data.oneHopMatches.length, 1);
+    assert.equal(syncCallCount, syncAfterIngest1, 'queryBrickOntology must never write to HydraDB');
+
+    // Re-ingest with only replacement-omega -> ephemeral-alpha must not linger on activeGraph
+    await rt.ingestBrickOntology({
+        bricks: [{ brickId: 'replacement-omega', orgId: 'org-a', sourceHash: hashB, ontology: { stacks: ['node-esm'] } }],
+    });
+    const qOld = await rt.queryBrickOntology({ query: 'ephemeral-alpha' });
+    assert.equal(qOld.data.oneHopMatches.length, 0);
+    const qStack = await rt.queryBrickOntology({ targetStack: 'node-esm' });
+    assert.equal(qStack.data.oneHopMatches.some((m) => m.brickId === 'ephemeral-alpha'), false);
+    assert.equal(qStack.data.oneHopMatches.some((m) => m.brickId === 'replacement-omega'), true);
+
+    // SEC-08 & BUG-04: Tampered unsigned ontology vs signed blueprint.ontology rejected, UTC offset normalized
+    const tamperedComp = compileExchangeSnapshotToHydraGraph({
+        bricks: [
+            {
+                format: 'krusch-sealed-brick/v1',
+                brickId: 'tampered-brick',
+                orgId: 'org-a',
+                sourceHash: hashA,
+                blueprint: { id: 'tampered-brick', ontology: { stacks: ['node-esm'], validFrom: '2026-11-20T23:30:00-05:00' } },
+                ontology: { stacks: ['cloudflare-edge'] },
+            },
+        ],
+    });
+    assert.equal(tamperedComp.ok, false);
+    assert.equal(tamperedComp.error.code, 'TAMPERED_ONTOLOGY');
+
+    const utcComp = compileExchangeSnapshotToHydraGraph({
+        orgs: [{ id: 'org-a', stacks: ['node-esm'] }],
+        bricks: [
+            {
+                brickId: 'utc-brick',
+                orgId: 'org-a',
+                sourceHash: hashA,
+                ontology: { stacks: ['node-esm'], validFrom: '2026-11-20T23:30:00-05:00' },
+            },
+        ],
+    });
+    assert.equal(utcComp.ok, true);
+    const utcNode = utcComp.data.nodes.find((n) => n.brickId === 'utc-brick');
+    assert.equal(utcNode.validFrom, '2026-11-21');
+    assert.ok(utcComp.data.nodes.some((n) => n.kind === 'org'));
+
+    // PERF-01: >512 bricks fails closed with SNAPSHOT_LIMIT_EXCEEDED
+    const oversized = Array.from({ length: 513 }, (_, idx) => ({
+        brickId: `bulk-brick-${idx}`,
+        orgId: 'org-a',
+        sourceHash: String(idx).padStart(64, '0'),
+        ontology: { stacks: ['node-esm'] },
+    }));
+    const limitRes = compileExchangeSnapshotToHydraGraph({ bricks: oversized });
+    assert.equal(limitRes.ok, false);
+    assert.equal(limitRes.error.code, 'SNAPSHOT_LIMIT_EXCEEDED');
 });

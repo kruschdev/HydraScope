@@ -619,11 +619,15 @@ export function createHydraOpenCypherClient(options = {}) {
      * @param {Array<Record<string, any>>} [snapshot.edges=[]] - Directed graph edges
      * @returns {Promise<ReturnType<typeof okEnvelope>>}
      */
-    async function syncGraphSnapshot({ nodes = [], edges = [] } = {}) {
+    async function syncGraphSnapshot({ nodes = [], edges = [], namespace: snapshotNamespace } = {}) {
         const safeNodes = Array.isArray(nodes) ? nodes : [];
         const safeEdges = Array.isArray(edges) ? edges : [];
+        const effectiveNamespace =
+            typeof snapshotNamespace === 'string' && snapshotNamespace.trim()
+                ? snapshotNamespace.trim()
+                : safeNamespace;
 
-        const rootVertexId = surrogateVertexId(safeNamespace, 'workspace:root');
+        const rootVertexId = surrogateVertexId(effectiveNamespace, 'workspace:root');
         const baseNodeCypher =
             'MERGE (root:WorkspaceRoot {id: $rootId, namespace: $ns})-[:CONTAINS]->(n:GraphNode {id: $id, namespace: $ns, logicalId: $logicalId, kind: $kind, title: $title, path: $path, isCurrent: $isCurrent})';
 
@@ -634,16 +638,21 @@ export function createHydraOpenCypherClient(options = {}) {
             if (!rawNode || typeof rawNode !== 'object') continue;
             const logicalId = String(rawNode.logicalId ?? rawNode.id ?? '').trim();
             if (!logicalId) continue;
+            const hasMatchingPrecomputedId =
+                (!rawNode.namespace || String(rawNode.namespace).trim() === effectiveNamespace) &&
+                effectiveNamespace === safeNamespace;
             const vertexId =
+                hasMatchingPrecomputedId &&
                 Number.isSafeInteger(rawNode.surrogateId) &&
                 rawNode.surrogateId >= 1000 &&
                 rawNode.surrogateId <= Number.MAX_SAFE_INTEGER
                     ? rawNode.surrogateId
-                    : Number.isSafeInteger(rawNode.vertexId) &&
+                    : hasMatchingPrecomputedId &&
+                        Number.isSafeInteger(rawNode.vertexId) &&
                         rawNode.vertexId >= 1000 &&
                         rawNode.vertexId <= Number.MAX_SAFE_INTEGER
                       ? rawNode.vertexId
-                      : surrogateVertexId(safeNamespace, logicalId);
+                      : surrogateVertexId(effectiveNamespace, logicalId);
             vertexIdByLogicalId.set(logicalId, vertexId);
             const kind = String(rawNode.kind ?? rawNode.type ?? rawNode.label ?? 'Artifact').trim() || 'Artifact';
             const title = String(rawNode.title ?? rawNode.name ?? logicalId).trim() || logicalId;
@@ -663,7 +672,7 @@ export function createHydraOpenCypherClient(options = {}) {
             /** @type {Record<string, unknown>} */
             const parameters = {
                 rootId: rootVertexId,
-                ns: safeNamespace,
+                ns: effectiveNamespace,
                 id: vertexId,
                 logicalId,
                 kind,

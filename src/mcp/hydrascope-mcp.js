@@ -9,6 +9,7 @@ import {
     okMcpResult,
     errorMcpResult
 } from '@krusch/toolkit/mcp';
+import { scrubSensitiveText } from '../utils/scrubber.js';
 
 function loadSealedBricksFromSqlite(dbPath) {
     const clean = String(dbPath || '').trim();
@@ -361,7 +362,11 @@ export function createHydraScopeMcp({ runtime, connect = false } = {}) {
                     return errorMcpResult(name, 'UNKNOWN_TOOL', `Unknown HydraScope tool: ${name}`);
             }
         } catch (err) {
-            return errorMcpResult(name, 'HYDRASCOPE_MCP_ERROR', err?.message || String(err));
+            return errorMcpResult(
+                name,
+                'HYDRASCOPE_MCP_ERROR',
+                scrubSensitiveText(err?.message || String(err))
+            );
         }
     };
 

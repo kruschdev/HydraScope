@@ -25,7 +25,7 @@ Coding agents burn `30,000+` tokens per turn stuffing whole files into prompts, 
 
 ### Module A: `src/connectors/hydradb-client.js`
 Native OpenCypher HTTP client for `hydra-db/hydradb` (`v0.4.0`).
-- `surrogateVertexId(namespace, logicalId)` -> deterministic positive safe integer (`1000..9007199254740000` within `Number.MAX_SAFE_INTEGER`, collision-free FNV/SHA-256 52-bit integer)
+- `surrogateVertexId(namespace, logicalId)` -> deterministic positive safe integer (`1000..281474976711655` within `Number.MAX_SAFE_INTEGER`, collision-free SHA-256 48-bit integer across Node and Edge shims)
 - `decodeHydraCell(cell)` / `decodeHydraQueryResult(payload)`
 - `scrubSensitiveStrings(value)`
 - `createHydraOpenCypherClient({ baseUrl, token, graphId, cellId, namespace, allowPrivateLan, allowTailscale, timeoutMs, fetchImpl })`:
@@ -60,7 +60,7 @@ Connects HydraScope as Pillar 2 of the [Common Ground · HydraScope · DEADBOLT 
 - `BRICK_ONTOLOGY_EDGE_TYPES`: Frozen 10-edge schema (`TARGETS_STACK`, `CONSUMES_PORT`, `PRODUCES_PORT`, `BRIDGES_CHANNEL`, `ROUTES_TO_MODEL`, `USES_STACK`, `LISTENS_CHANNEL`, `REQUIRES_PORT`, `SUPERSEDES`, `GOVERNS`) spanning the 4 ontology axes (`SoftwareStack`, `DataPort`, `Channel`, `MoEProfile`).
 - `compileExchangeSnapshotToHydraGraph(snapshot, { workspaceName, namespace })` -> compiles sealed brick bundles and org profiles with deterministic 48-bit SHA-256 `surrogateId`s, pre-slugification Zero-Leak scrubbing, qualified `brickId@hash` / 64-hex `sourceHash` `:SUPERSEDES` resolution, same-`orgId` isolation, and cycle guards while preserving repository AST edges in Mode 1.
 - `mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph)` -> non-destructively wires `brick:<brickId>@<hash> -[:GOVERNS]-> file:bricks/<brickId>/index.(js|ts)` anchored to repo-root `^bricks/`.
-- `syncAndQueryBrickOntology(...)` -> executes 1-hop brick ranking, 2-hop `PRODUCES_PORT -> CONSUMES_PORT` pipeline discovery with port-namespace collision blocking, `:GOVERNS` -> downstream repository AST caller traversal (`downstreamRepoCallers`), and `asOf` historical lineage filtering.
+- `syncAndQueryBrickOntology(...)` -> executes 1-hop brick ranking, bounded 2-hop `PRODUCES_PORT -> CONSUMES_PORT` pipeline discovery (`MAX_ONTOLOGY_BRICKS = 512`, `MAX_ONTOLOGY_NODES = 2048`, `MAX_ONTOLOGY_EDGES = 8192`, port-indexed consumers, top-256 cap) with port-namespace collision blocking, `:GOVERNS` -> downstream repository AST caller traversal (`downstreamRepoCallers`), UTC-normalized `asOf` historical lineage filtering, and optional `syncToHydra` (default `true` on explicit ingest/direct sync, `false` inside read-only `runtime.queryBrickOntology` / `POST /api/ontology/query` / `hydrascope_traverse_context`).
 
 ### Module E: Choke Points (Wired by Orchestrator)
 - `src/server.js`: HTTP API (`GET /api/state`, `POST /api/arena/compare`, `POST /api/benchmark/run`, `POST /api/decisions/supersede`, `POST /api/workspace/ingest-dir`, `POST /api/ontology/ingest`, `POST /api/ontology/query`) + static serving of `client/dist`.

@@ -11,7 +11,12 @@
 import { okEnvelope, errorEnvelope } from '@krusch/toolkit/http';
 import { surrogateVertexId, scrubSensitiveStrings } from '../connectors/hydradb-client.js';
 import { FORBIDDEN_OBJECT_KEYS, scrubSensitiveText } from '../utils/scrubber.js';
-import { isValidIsoDate, validateOptionalAsOf } from '../utils/validation.js';
+import { normalizeIsoDateOrTimestamp, validateOptionalAsOf } from '../utils/validation.js';
+
+export const MAX_ONTOLOGY_BRICKS = 512;
+export const MAX_ONTOLOGY_NODES = 2048;
+export const MAX_ONTOLOGY_EDGES = 8192;
+export const MAX_TWO_HOP_COMPOSITIONS = 256;
 
 export const BRICK_ONTOLOGY_EDGE_TYPES = Object.freeze([
     'TARGETS_STACK',
@@ -43,6 +48,7 @@ const ONTOLOGY_NODE_KINDS = new Set([
     'channel',
     'moe_profile',
     'org_profile',
+    'org',
 ]);
 const HEX_64_RE = /^[0-9a-f]{64}$/i;
 
@@ -172,17 +178,35 @@ function isPlainObject(value) {
 }
 
 /**
- * Extract a valid `YYYY-MM-DD` calendar date prefix from an ISO-8601 date or timestamp.
+ * Produce deterministic key-sorted JSON for comparing signed vs top-level ontology objects.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function canonicalJson(value) {
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map((item) => canonicalJson(item === undefined ? null : item)).join(',')}]`;
+    }
+    const keys = Object.keys(/** @type {Record<string, unknown>} */ (value))
+        .filter((k) => !FORBIDDEN_OBJECT_KEYS.has(k) && /** @type {any} */ (value)[k] !== undefined)
+        .sort();
+    const parts = keys.map(
+        (k) => `${JSON.stringify(k)}:${canonicalJson(/** @type {any} */ (value)[k])}`
+    );
+    return `{${parts.join(',')}}`;
+}
+
+/**
+ * Extract a valid UTC `YYYY-MM-DD` calendar date from a strict ISO-8601 date or timestamp.
  *
  * @param {unknown} raw
  * @returns {string | null}
  */
 function extractIsoDate(raw) {
-    if (typeof raw !== 'string') return null;
-    const trimmed = raw.trim();
-    if (!trimmed) return null;
-    const candidate = trimmed.length >= 10 ? trimmed.slice(0, 10) : trimmed;
-    return isValidIsoDate(candidate) ? candidate : null;
+    return normalizeIsoDateOrTimestamp(raw);
 }
 
 /**
@@ -348,6 +372,17 @@ function parseBrickLogicalId(rawId) {
 }
 
 /**
+ * Normalize an MoE profile slug from either `moe:<slug>`, `moe_profile:<slug>`, or bare `<slug>`.
+ *
+ * @param {unknown} rawMoe
+ * @returns {string}
+ */
+function normalizeMoeSlug(rawMoe) {
+    const strippedProfile = normalizeEntitySlug(rawMoe, 'moe_profile');
+    return normalizeEntitySlug(strippedProfile, 'moe').toLowerCase();
+}
+
+/**
  * Infer HydraScope ontology vertex `kind` from logical ID prefix when `kind` is omitted.
  *
  * @param {string} id
@@ -359,8 +394,8 @@ function inferOntologyNodeKind(id) {
     if (lower.startsWith('stack:')) return 'stack';
     if (lower.startsWith('port:')) return 'port';
     if (lower.startsWith('channel:')) return 'channel';
-    if (lower.startsWith('moe:')) return 'moe_profile';
-    if (lower.startsWith('org:')) return 'org_profile';
+    if (lower.startsWith('moe:') || lower.startsWith('moe_profile:')) return 'moe_profile';
+    if (lower.startsWith('org:')) return 'org';
     return 'ontology_entity';
 }
 
@@ -394,24 +429,23 @@ function buildDefaultOntologyPath(id, kind) {
  */
 function isOntologyNodeActiveAt(node, asOf = null, nodeById = null) {
     if (!node || typeof node !== 'object') return false;
-    const cleanAsOf = typeof asOf === 'string' && asOf.trim().length > 0 ? asOf.trim() : null;
-    if (!cleanAsOf || !isValidIsoDate(cleanAsOf)) {
-        return node.isCurrent !== false && !node.retiredAt;
+    const asOfCheck = validateOptionalAsOf(asOf);
+    const cleanAsOf = asOfCheck.ok ? asOfCheck.value : null;
+    const nodeValidFrom = extractIsoDate(node.validFrom);
+    const nodeRetiredAt = extractIsoDate(node.retiredAt);
+    if (!cleanAsOf) {
+        return node.isCurrent !== false && !nodeRetiredAt;
     }
-    const validOk = !node.validFrom || node.validFrom <= cleanAsOf;
+    const validOk = !nodeValidFrom || nodeValidFrom <= cleanAsOf;
     if (!validOk) return false;
-    if (node.retiredAt) {
-        return cleanAsOf < node.retiredAt;
+    if (nodeRetiredAt) {
+        return cleanAsOf < nodeRetiredAt;
     }
     if (node.isCurrent === false) {
         const repl =
             node.supersededBy && nodeById instanceof Map ? nodeById.get(node.supersededBy) : null;
-        return Boolean(
-            repl &&
-                typeof repl.validFrom === 'string' &&
-                isValidIsoDate(repl.validFrom) &&
-                repl.validFrom > cleanAsOf
-        );
+        const replValidFrom = repl ? extractIsoDate(repl.validFrom) : null;
+        return Boolean(replValidFrom && replValidFrom > cleanAsOf);
     }
     return true;
 }
@@ -508,6 +542,43 @@ export function compileExchangeSnapshotToHydraGraph(
         );
     }
 
+    if (Array.isArray(unwrapped.bricks) && unwrapped.bricks.length > MAX_ONTOLOGY_BRICKS) {
+        return /** @type {object} */ (
+            scrubSensitiveStrings(
+                errorEnvelope(
+                    'SNAPSHOT_LIMIT_EXCEEDED',
+                    `Snapshot bricks count (${unwrapped.bricks.length}) exceeds maximum of ${MAX_ONTOLOGY_BRICKS}.`,
+                    { limit: MAX_ONTOLOGY_BRICKS, count: unwrapped.bricks.length },
+                    tool
+                )
+            )
+        );
+    }
+    if (Array.isArray(unwrapped.nodes) && unwrapped.nodes.length > MAX_ONTOLOGY_NODES) {
+        return /** @type {object} */ (
+            scrubSensitiveStrings(
+                errorEnvelope(
+                    'SNAPSHOT_LIMIT_EXCEEDED',
+                    `Snapshot nodes count (${unwrapped.nodes.length}) exceeds maximum of ${MAX_ONTOLOGY_NODES}.`,
+                    { limit: MAX_ONTOLOGY_NODES, count: unwrapped.nodes.length },
+                    tool
+                )
+            )
+        );
+    }
+    if (Array.isArray(unwrapped.edges) && unwrapped.edges.length > MAX_ONTOLOGY_EDGES) {
+        return /** @type {object} */ (
+            scrubSensitiveStrings(
+                errorEnvelope(
+                    'SNAPSHOT_LIMIT_EXCEEDED',
+                    `Snapshot edges count (${unwrapped.edges.length}) exceeds maximum of ${MAX_ONTOLOGY_EDGES}.`,
+                    { limit: MAX_ONTOLOGY_EDGES, count: unwrapped.edges.length },
+                    tool
+                )
+            )
+        );
+    }
+
     const safeWorkspaceName =
         scrubSensitiveText(String(workspaceName || unwrapped.workspaceName || 'brick-exchange-ontology').trim()) ||
         'brick-exchange-ontology';
@@ -523,6 +594,9 @@ export function compileExchangeSnapshotToHydraGraph(
     const brickAliasIndex = new Map();
     /** @type {Array<{ newerId: string, olderRef: string }>} */
     const pendingSupersedes = [];
+    /** @type {object | null} */
+    let compileError = null;
+    let brickNodeCount = 0;
 
     const registerBrickAlias = (alias, canonicalId) => {
         const key = String(alias ?? '').trim();
@@ -541,6 +615,7 @@ export function compileExchangeSnapshotToHydraGraph(
     };
 
     const upsertNode = (raw) => {
+        if (compileError) return null;
         const cleanId = scrubSensitiveText(String(raw.id ?? '').trim());
         if (!cleanId || FORBIDDEN_OBJECT_KEYS.has(cleanId)) return null;
         if (nodeById.has(cleanId)) {
@@ -548,14 +623,53 @@ export function compileExchangeSnapshotToHydraGraph(
         }
 
         const kind = scrubSensitiveText(String(raw.kind || inferOntologyNodeKind(cleanId)).trim()) || 'ontology_entity';
+        const isBrickNode = kind === 'brick' || cleanId.startsWith('brick:');
+        if (isBrickNode && brickNodeCount >= MAX_ONTOLOGY_BRICKS) {
+            compileError = errorEnvelope(
+                'SNAPSHOT_LIMIT_EXCEEDED',
+                `Compiled brick vertex count exceeds maximum of ${MAX_ONTOLOGY_BRICKS}.`,
+                { limit: MAX_ONTOLOGY_BRICKS },
+                tool
+            );
+            return null;
+        }
+        if (nodeById.size >= MAX_ONTOLOGY_NODES) {
+            compileError = errorEnvelope(
+                'SNAPSHOT_LIMIT_EXCEEDED',
+                `Compiled ontology vertex count exceeds maximum of ${MAX_ONTOLOGY_NODES}.`,
+                { limit: MAX_ONTOLOGY_NODES },
+                tool
+            );
+            return null;
+        }
+
         const title = scrubSensitiveText(String(raw.title || cleanId).trim()) || cleanId;
         const nodePath = scrubSensitiveText(String(raw.path || buildDefaultOntologyPath(cleanId, kind)).trim());
         const content = scrubSensitiveText(String(raw.content || title).trim());
         const validFrom = extractIsoDate(raw.validFrom) || null;
         const retiredAt = extractIsoDate(raw.retiredAt) || null;
-        const supersededBy = raw.supersededBy ? scrubSensitiveText(String(raw.supersededBy).trim()) : null;
+        if (validFrom && retiredAt && retiredAt < validFrom) {
+            compileError = errorEnvelope(
+                'INVALID_TEMPORAL_WINDOW',
+                `Invalid temporal window on "${cleanId}": retiredAt (${retiredAt}) precedes validFrom (${validFrom}).`,
+                { id: cleanId, validFrom, retiredAt },
+                tool
+            );
+            return null;
+        }
+
+        const candidateSupersededBy = raw.supersededBy
+            ? scrubSensitiveText(String(raw.supersededBy).trim())
+            : null;
+        if (candidateSupersededBy) {
+            pendingSupersedes.push({ newerId: candidateSupersededBy, olderRef: cleanId });
+        }
         const isCurrent =
-            typeof raw.isCurrent === 'boolean' ? raw.isCurrent : !retiredAt && !supersededBy;
+            typeof raw.isCurrent === 'boolean'
+                ? candidateSupersededBy
+                    ? !retiredAt
+                    : raw.isCurrent
+                : !retiredAt;
 
         const node = {
             id: cleanId,
@@ -568,7 +682,7 @@ export function compileExchangeSnapshotToHydraGraph(
             validFrom,
             retiredAt,
             isCurrent,
-            supersededBy,
+            supersededBy: null,
         };
 
         if (Array.isArray(raw.symbols) && raw.symbols.length > 0) {
@@ -593,11 +707,15 @@ export function compileExchangeSnapshotToHydraGraph(
             }
         }
 
+        if (isBrickNode) {
+            brickNodeCount += 1;
+        }
         nodeById.set(cleanId, node);
         return node;
     };
 
     const addOntologyEdge = (from, to, rawType, extraReason = null) => {
+        if (compileError) return;
         const cleanFrom = scrubSensitiveText(String(from ?? '').trim());
         const cleanTo = scrubSensitiveText(String(to ?? '').trim());
         const cleanType = String(rawType ?? '')
@@ -610,6 +728,15 @@ export function compileExchangeSnapshotToHydraGraph(
         if (!isOntEdge && !isRepoEdge) return;
         const key = `${cleanFrom}|${cleanType}|${cleanTo}`;
         if (!edgeByKey.has(key)) {
+            if (edgeByKey.size >= MAX_ONTOLOGY_EDGES) {
+                compileError = errorEnvelope(
+                    'SNAPSHOT_LIMIT_EXCEEDED',
+                    `Compiled ontology edge count exceeds maximum of ${MAX_ONTOLOGY_EDGES}.`,
+                    { limit: MAX_ONTOLOGY_EDGES },
+                    tool
+                );
+                return;
+            }
             const edgeObj = {
                 from: cleanFrom,
                 to: cleanTo,
@@ -622,97 +749,103 @@ export function compileExchangeSnapshotToHydraGraph(
         }
     };
 
-    const ensureStackNode = (rawStack, extra = {}) => {
+    const ensureStackNode = (rawStack, extra = null) => {
         const slug = normalizeEntitySlug(rawStack, 'stack').toLowerCase();
         if (!slug) return null;
         const id = `stack:${slug}`;
+        if (!extra && nodeById.has(id)) return nodeById.get(id);
+        const meta = extra || {};
         const preset = Object.hasOwn(CANONICAL_STACK_META, slug) ? CANONICAL_STACK_META[slug] : null;
-        const title = extra.title || extra.name || preset?.title || `Stack ${slug}`;
-        const runtimeFamily = extra.runtimeFamily || preset?.runtimeFamily || 'unknown';
-        const purity = Boolean(extra.requiresWebStandardPurity ?? preset?.requiresWebStandardPurity);
+        const title = meta.title || meta.name || preset?.title || `Stack ${slug}`;
+        const runtimeFamily = meta.runtimeFamily || preset?.runtimeFamily || 'unknown';
+        const purity = Boolean(meta.requiresWebStandardPurity ?? preset?.requiresWebStandardPurity);
         const content =
-            extra.content ||
-            extra.summary ||
+            meta.content ||
+            meta.summary ||
             `${title} (${slug}) | runtimeFamily=${runtimeFamily} | requiresWebStandardPurity=${purity}`;
         return upsertNode({
             id,
             kind: 'stack',
             title,
-            path: extra.path || `ontology/stacks/${slug}.json`,
+            path: meta.path || `ontology/stacks/${slug}.json`,
             content,
             symbols: [slug],
-            validFrom: extra.validFrom,
-            retiredAt: extra.retiredAt,
-            isCurrent: extra.isCurrent,
-            supersededBy: extra.supersededBy,
+            validFrom: meta.validFrom,
+            retiredAt: meta.retiredAt,
+            isCurrent: meta.isCurrent,
+            supersededBy: meta.supersededBy,
         });
     };
 
-    const ensurePortNode = (rawPort, extra = {}) => {
+    const ensurePortNode = (rawPort, extra = null) => {
         const parsed = parsePortScope(rawPort);
         if (!parsed.slug) return null;
         const id = `port:${parsed.slug}`;
+        if (!extra && nodeById.has(id)) return nodeById.get(id);
+        const meta = extra || {};
         const preset =
             !parsed.namespaced && Object.hasOwn(CANONICAL_PORT_META, parsed.slug)
                 ? CANONICAL_PORT_META[parsed.slug]
                 : null;
         const shared =
-            typeof extra.shared === 'boolean'
-                ? extra.shared
+            typeof meta.shared === 'boolean'
+                ? meta.shared
                 : parsed.namespaced
                   ? false
                   : Boolean(preset?.shared ?? true);
         const aliases = uniqueSafeStrings([
-            ...(Array.isArray(extra.aliases) ? extra.aliases : []),
+            ...(Array.isArray(meta.aliases) ? meta.aliases : []),
             ...(Array.isArray(preset?.aliases) ? preset.aliases : []),
         ]);
         const title =
-            extra.title ||
-            extra.name ||
+            meta.title ||
+            meta.name ||
             preset?.title ||
             (parsed.namespaced ? `Namespaced Port ${parsed.slug}` : `DataPort ${parsed.slug}`);
         const content =
-            extra.content ||
-            extra.summary ||
+            meta.content ||
+            meta.summary ||
             `${title} (${parsed.slug}) | shared=${shared}${parsed.namespace ? ` | namespace=${parsed.namespace}` : ''}${aliases.length > 0 ? ` | aliases=${aliases.join(', ')}` : ''}`;
         return upsertNode({
             id,
             kind: 'port',
             title,
-            path: extra.path || `ontology/ports/${parsed.slug.replace(/:/g, '_')}.json`,
+            path: meta.path || `ontology/ports/${parsed.slug.replace(/:/g, '_')}.json`,
             content,
             symbols: [parsed.slug],
             synonyms: aliases,
             shared,
             portNamespace: parsed.namespace || undefined,
-            validFrom: extra.validFrom,
-            retiredAt: extra.retiredAt,
-            isCurrent: extra.isCurrent,
-            supersededBy: extra.supersededBy,
+            validFrom: meta.validFrom,
+            retiredAt: meta.retiredAt,
+            isCurrent: meta.isCurrent,
+            supersededBy: meta.supersededBy,
         });
     };
 
-    const ensureChannelNode = (rawChannel, extra = {}) => {
+    const ensureChannelNode = (rawChannel, extra = null) => {
         const slug = normalizeEntitySlug(rawChannel, 'channel').toLowerCase();
         if (!slug) return null;
         const id = `channel:${slug}`;
+        if (!extra && nodeById.has(id)) return nodeById.get(id);
+        const meta = extra || {};
         const preset = Object.hasOwn(CANONICAL_CHANNEL_META, slug) ? CANONICAL_CHANNEL_META[slug] : null;
-        const title = extra.title || extra.name || preset?.title || `Channel ${slug}`;
-        const content = extra.content || extra.summary || `${title} (${slug})`;
+        const title = meta.title || meta.name || preset?.title || `Channel ${slug}`;
+        const content = meta.content || meta.summary || `${title} (${slug})`;
         const channelNode = upsertNode({
             id,
             kind: 'channel',
             title,
-            path: extra.path || `ontology/channels/${slug.replace(/:/g, '_')}.json`,
+            path: meta.path || `ontology/channels/${slug.replace(/:/g, '_')}.json`,
             content,
             symbols: [slug],
-            validFrom: extra.validFrom,
-            retiredAt: extra.retiredAt,
-            isCurrent: extra.isCurrent,
-            supersededBy: extra.supersededBy,
+            validFrom: meta.validFrom,
+            retiredAt: meta.retiredAt,
+            isCurrent: meta.isCurrent,
+            supersededBy: meta.supersededBy,
         });
 
-        const reqPorts = uniqueSafeStrings(extra.requiresPorts || extra.requiredPorts || []);
+        const reqPorts = uniqueSafeStrings(meta.requiresPorts || meta.requiredPorts || []);
         for (const p of reqPorts) {
             const pNode = ensurePortNode(p);
             if (channelNode && pNode) {
@@ -722,37 +855,43 @@ export function compileExchangeSnapshotToHydraGraph(
         return channelNode;
     };
 
-    const ensureMoeNode = (rawMoe, extra = {}) => {
-        const slug = normalizeEntitySlug(rawMoe, 'moe').toLowerCase();
+    const ensureMoeNode = (rawMoe, extra = null) => {
+        const slug = normalizeMoeSlug(rawMoe);
         if (!slug) return null;
         const id = `moe:${slug}`;
+        if (!extra && nodeById.has(id)) return nodeById.get(id);
+        const meta = extra || {};
         const preset = Object.hasOwn(CANONICAL_MOE_META, slug) ? CANONICAL_MOE_META[slug] : null;
-        const title = extra.title || extra.name || preset?.title || `MoE Profile ${slug}`;
-        const tier = extra.dispatchTier || preset?.dispatchTier || 'L2_HEAVY_MOE';
-        const content = extra.content || extra.summary || `${title} (${slug}) | dispatchTier=${tier}`;
+        const title = meta.title || meta.name || preset?.title || `MoE Profile ${slug}`;
+        const tier = meta.dispatchTier || preset?.dispatchTier || 'L2_HEAVY_MOE';
+        const content = meta.content || meta.summary || `${title} (${slug}) | dispatchTier=${tier}`;
         return upsertNode({
             id,
             kind: 'moe_profile',
             title,
-            path: extra.path || `ontology/moe/${slug}.json`,
+            path: meta.path || `ontology/moe/${slug}.json`,
             content,
             symbols: [slug],
-            validFrom: extra.validFrom,
-            retiredAt: extra.retiredAt,
-            isCurrent: extra.isCurrent,
-            supersededBy: extra.supersededBy,
+            validFrom: meta.validFrom,
+            retiredAt: meta.retiredAt,
+            isCurrent: meta.isCurrent,
+            supersededBy: meta.supersededBy,
         });
     };
 
     // Mode 1: Pre-compiled ontology graph (`{ nodes, edges }`)
     if (Array.isArray(unwrapped.nodes)) {
         for (const rawNode of unwrapped.nodes) {
+            if (compileError) break;
             if (!isPlainObject(rawNode)) continue;
             const rawId = String(rawNode.id ?? rawNode.logicalId ?? '').trim();
             if (!rawId || FORBIDDEN_OBJECT_KEYS.has(rawId)) continue;
             const kind = String(rawNode.kind || rawNode.type || inferOntologyNodeKind(rawId)).trim();
             const parsedBrick = kind === 'brick' || rawId.startsWith('brick:') ? parseBrickLogicalId(rawId) : null;
             const parsedPort = kind === 'port' || rawId.startsWith('port:') ? parsePortScope(rawId) : null;
+            const fallbackSymbol =
+                parsedBrick?.brickId ||
+                (kind === 'moe_profile' ? normalizeMoeSlug(rawId) : normalizeEntitySlug(rawId, kind));
 
             const created = upsertNode({
                 id: rawId,
@@ -765,7 +904,7 @@ export function compileExchangeSnapshotToHydraGraph(
                     `${rawNode.title || rawNode.name || rawId} (${rawId})`,
                 symbols: Array.isArray(rawNode.symbols)
                     ? rawNode.symbols
-                    : [parsedBrick?.brickId || normalizeEntitySlug(rawId, kind)].filter(Boolean),
+                    : [fallbackSymbol].filter(Boolean),
                 synonyms: Array.isArray(rawNode.synonyms) ? rawNode.synonyms : [],
                 brickId: rawNode.brickId || parsedBrick?.brickId || undefined,
                 shared:
@@ -851,8 +990,13 @@ export function compileExchangeSnapshotToHydraGraph(
         else if (isPlainObject(mp)) ensureMoeNode(mp.id || mp.slug || mp.name, mp);
     }
 
-    const orgProfiles = Array.isArray(unwrapped.orgProfiles) ? unwrapped.orgProfiles : [];
+    const orgProfiles = Array.isArray(unwrapped.orgProfiles)
+        ? unwrapped.orgProfiles
+        : Array.isArray(unwrapped.orgs)
+          ? unwrapped.orgs
+          : [];
     for (const org of orgProfiles) {
+        if (compileError) break;
         if (!isPlainObject(org)) continue;
         const rawOrgIdent = scrubSensitiveText(String(org.orgId || org.id || org.slug || org.name || '').trim());
         const slug = normalizeEntitySlug(rawOrgIdent, 'org');
@@ -871,7 +1015,7 @@ export function compileExchangeSnapshotToHydraGraph(
 
         const orgNode = upsertNode({
             id: orgNodeId,
-            kind: 'org_profile',
+            kind: 'org',
             title,
             path: `ontology/orgs/${safeOrgSlug}.json`,
             content,
@@ -900,19 +1044,61 @@ export function compileExchangeSnapshotToHydraGraph(
 
     const rawBricks = Array.isArray(unwrapped.bricks) ? unwrapped.bricks : [];
     for (const rawEntry of rawBricks) {
+        if (compileError) break;
         if (!isPlainObject(rawEntry)) continue;
-        const rawBrick =
-            isPlainObject(rawEntry.bundle)
-                ? {
-                      ...rawEntry.bundle,
-                      ontology: rawEntry.ontology || rawEntry.bundle.ontology,
-                  }
-                : rawEntry;
+        if (
+            isPlainObject(rawEntry.bundle) &&
+            rawEntry.ontology !== undefined &&
+            rawEntry.ontology !== null &&
+            isPlainObject(rawEntry.bundle.blueprint?.ontology) &&
+            (!isPlainObject(rawEntry.ontology) ||
+                canonicalJson(rawEntry.ontology) !== canonicalJson(rawEntry.bundle.blueprint.ontology))
+        ) {
+            return /** @type {object} */ (
+                scrubSensitiveStrings(
+                    errorEnvelope(
+                        'TAMPERED_ONTOLOGY',
+                        'Wrapper brick ontology does not match sealed bundle blueprint.ontology.',
+                        { brickId: String(rawEntry.bundle.brickId || rawEntry.bundle.blueprint?.id || '') },
+                        tool
+                    )
+                )
+            );
+        }
 
-        const ont = isPlainObject(rawBrick.ontology)
-            ? rawBrick.ontology
-            : isPlainObject(rawBrick.blueprint?.ontology)
-              ? rawBrick.blueprint.ontology
+        const rawBrick = isPlainObject(rawEntry.bundle)
+            ? {
+                  ...rawEntry.bundle,
+                  ...(rawEntry.ontology !== undefined && rawEntry.bundle.ontology === undefined
+                      ? { ontology: rawEntry.ontology }
+                      : {}),
+              }
+            : rawEntry;
+
+        const hasBlueprintOnt = isPlainObject(rawBrick.blueprint?.ontology);
+        const hasTopOnt = isPlainObject(rawBrick.ontology);
+        if (hasBlueprintOnt && rawBrick.ontology !== undefined && rawBrick.ontology !== null) {
+            if (
+                !hasTopOnt ||
+                canonicalJson(rawBrick.ontology) !== canonicalJson(rawBrick.blueprint.ontology)
+            ) {
+                return /** @type {object} */ (
+                    scrubSensitiveStrings(
+                        errorEnvelope(
+                            'TAMPERED_ONTOLOGY',
+                            'Unsigned top-level brick ontology does not match sealed blueprint.ontology.',
+                            { brickId: String(rawBrick.brickId || rawBrick.blueprint?.id || '') },
+                            tool
+                        )
+                    )
+                );
+            }
+        }
+
+        const ont = hasBlueprintOnt
+            ? rawBrick.blueprint.ontology
+            : hasTopOnt
+              ? rawBrick.ontology
               : {};
 
         const parsedFromId =
@@ -933,14 +1119,23 @@ export function compileExchangeSnapshotToHydraGraph(
             .replace(/^-+|-+$/g, '');
         if (!brickId || FORBIDDEN_OBJECT_KEYS.has(brickId)) continue;
 
-        const brickOrgRaw =
-            rawBrick.orgId ??
-            rawBrick.org ??
-            ont.orgId ??
-            rawBrick.lineage?.orgId ??
-            rawBrick.publisher?.orgId ??
-            rawBrick.blueprint?.orgId ??
-            null;
+        const isSealedBrick =
+            rawBrick.format === 'krusch-sealed-brick/v1' || isPlainObject(rawBrick.blueprint);
+        const brickOrgRaw = isSealedBrick
+            ? (rawBrick.lineage?.orgId ??
+              rawBrick.blueprint?.orgId ??
+              ont.orgId ??
+              rawBrick.orgId ??
+              rawBrick.org ??
+              rawBrick.publisher?.orgId ??
+              null)
+            : (rawBrick.orgId ??
+              rawBrick.org ??
+              ont.orgId ??
+              rawBrick.lineage?.orgId ??
+              rawBrick.publisher?.orgId ??
+              rawBrick.blueprint?.orgId ??
+              null);
 
         const explicitHash = sanitizeBrickHashToken(
             rawBrick.lineage?.sourceHash ||
@@ -1081,11 +1276,8 @@ export function compileExchangeSnapshotToHydraGraph(
         }
     }
 
-    // Also honor pre-declared `supersededBy` fields on older brick nodes
-    for (const node of nodeById.values()) {
-        if (node.supersededBy) {
-            pendingSupersedes.push({ newerId: node.supersededBy, olderRef: node.id });
-        }
+    if (compileError) {
+        return /** @type {object} */ (scrubSensitiveStrings(compileError));
     }
 
     const isQualifiedBrickReference = (rawRef) => {
@@ -1191,12 +1383,13 @@ export function compileExchangeSnapshotToHydraGraph(
     };
 
     for (const { newerCanonicalId, olderCanonicalId } of resolvedSupersedes) {
+        if (compileError) break;
         const newerNode = nodeById.get(newerCanonicalId);
         const olderNode = nodeById.get(olderCanonicalId);
         if (!newerNode || !olderNode) continue;
 
-        // Enforce same-organization isolation (`!newer.orgId || !older.orgId || newer.orgId === older.orgId`)
-        if (newerNode.orgId && olderNode.orgId && newerNode.orgId !== olderNode.orgId) {
+        // Enforce strict organization equality (`String(newer.orgId || '') === String(older.orgId || '')`)
+        if (String(newerNode.orgId || '') !== String(olderNode.orgId || '')) {
             continue;
         }
 
@@ -1212,10 +1405,17 @@ export function compileExchangeSnapshotToHydraGraph(
 
         olderNode.isCurrent = false;
         olderNode.supersededBy = newerNode.id;
-        if (!olderNode.retiredAt) {
-            olderNode.retiredAt = newerNode.validFrom || null;
+        if (!olderNode.retiredAt && newerNode.validFrom) {
+            olderNode.retiredAt =
+                olderNode.validFrom && newerNode.validFrom < olderNode.validFrom
+                    ? olderNode.validFrom
+                    : newerNode.validFrom;
         }
         addOntologyEdge(newerNode.id, olderNode.id, 'SUPERSEDES');
+    }
+
+    if (compileError) {
+        return /** @type {object} */ (scrubSensitiveStrings(compileError));
     }
 
     const rawGraph = {
@@ -1302,9 +1502,11 @@ function matchVendoredBrickIdFromRepoNode(repoNode) {
  *
  * @param {object} repoGraph
  * @param {object} ontologyGraph
+ * @param {object} [options={}]
+ * @param {string} [options.namespace]
  * @returns {object} `INV-LEGO-01` envelope
  */
-export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph) {
+export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph, { namespace } = {}) {
     const tool = 'hydrascope.brick_ontology.merge';
     const baseRepo =
         isPlainObject(repoGraph) && repoGraph.ok === true && isPlainObject(repoGraph.data)
@@ -1332,9 +1534,8 @@ export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph) {
         );
     }
 
-    const mergedNamespace =
-        scrubSensitiveText(String(baseRepo.namespace || baseOnt.namespace || 'brick-ontology').trim()) ||
-        'brick-ontology';
+    const effectiveNamespace = namespace || baseOnt.namespace || baseRepo.namespace || 'default';
+    const mergedNamespace = scrubSensitiveText(String(effectiveNamespace).trim()) || 'default';
     const mergedWorkspaceName =
         scrubSensitiveText(String(baseRepo.workspaceName || baseOnt.workspaceName || 'merged-workspace').trim()) ||
         'merged-workspace';
@@ -1350,23 +1551,24 @@ export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph) {
         if (!cleanId || FORBIDDEN_OBJECT_KEYS.has(cleanId)) return null;
         const cloned = /** @type {Record<string, any>} */ (scrubSensitiveStrings(rawNode));
         const content = String(cloned.content ?? '');
+        const normalizedValidFrom = extractIsoDate(cloned.validFrom) || null;
+        const rawNormalizedRetiredAt = extractIsoDate(cloned.retiredAt) || null;
+        const normalizedRetiredAt =
+            normalizedValidFrom && rawNormalizedRetiredAt && rawNormalizedRetiredAt < normalizedValidFrom
+                ? normalizedValidFrom
+                : rawNormalizedRetiredAt;
         return {
             ...cloned,
             id: cleanId,
-            surrogateId:
-                Number.isSafeInteger(cloned.surrogateId) &&
-                cloned.surrogateId >= 1000 &&
-                cloned.surrogateId <= Number.MAX_SAFE_INTEGER
-                    ? cloned.surrogateId
-                    : surrogateVertexId(mergedNamespace, cleanId),
+            surrogateId: surrogateVertexId(mergedNamespace, cleanId),
             kind: String(cloned.kind || inferOntologyNodeKind(cleanId)),
             title: String(cloned.title || cleanId),
             path: cloned.path ?? null,
             content,
             tokens: Number(cloned.tokens) > 0 ? Number(cloned.tokens) : estimateTokens(content),
-            validFrom: cloned.validFrom || null,
-            retiredAt: cloned.retiredAt || null,
-            isCurrent: cloned.isCurrent !== false && !cloned.retiredAt,
+            validFrom: normalizedValidFrom,
+            retiredAt: normalizedRetiredAt,
+            isCurrent: cloned.isCurrent !== false && !normalizedRetiredAt,
             supersededBy: cloned.supersededBy || null,
         };
     };
@@ -1380,10 +1582,7 @@ export function mergeOntologyIntoRepoGraph(repoGraph, ontologyGraph) {
         if (!cloned) continue;
         const existing = mergedNodesById.get(cloned.id);
         if (!existing || ONTOLOGY_NODE_KINDS.has(cloned.kind)) {
-            mergedNodesById.set(cloned.id, {
-                ...cloned,
-                surrogateId: surrogateVertexId(mergedNamespace, cloned.id),
-            });
+            mergedNodesById.set(cloned.id, cloned);
         }
     }
 
@@ -1571,6 +1770,7 @@ export async function syncAndQueryBrickOntology({
     maxHops = 2,
     hydraClient = null,
     namespace = 'brick-ontology',
+    syncToHydra = true,
 } = {}) {
     const tool = 'hydrascope.brick_ontology.query';
 
@@ -1599,7 +1799,9 @@ export async function syncAndQueryBrickOntology({
 
     let workingGraph = compiledRes.data;
     if (baseRepoGraph !== null && baseRepoGraph !== undefined) {
-        const mergedRes = mergeOntologyIntoRepoGraph(baseRepoGraph, workingGraph);
+        const mergedRes = mergeOntologyIntoRepoGraph(baseRepoGraph, workingGraph, {
+            namespace: workingGraph.namespace,
+        });
         if (!mergedRes.ok) {
             return /** @type {object} */ (
                 scrubSensitiveStrings(
@@ -1615,25 +1817,56 @@ export async function syncAndQueryBrickOntology({
         workingGraph = mergedRes.data;
     }
 
+    const totalBrickCount = workingGraph.nodes.reduce(
+        (acc, n) => acc + (n && (n.kind === 'brick' || String(n.id).startsWith('brick:')) ? 1 : 0),
+        0
+    );
+    if (
+        totalBrickCount > MAX_ONTOLOGY_BRICKS ||
+        workingGraph.nodes.length > MAX_ONTOLOGY_NODES ||
+        workingGraph.edges.length > MAX_ONTOLOGY_EDGES
+    ) {
+        return /** @type {object} */ (
+            scrubSensitiveStrings(
+                errorEnvelope(
+                    'SNAPSHOT_LIMIT_EXCEEDED',
+                    `Merged ontology graph exceeds limits (bricks=${totalBrickCount}/${MAX_ONTOLOGY_BRICKS}, nodes=${workingGraph.nodes.length}/${MAX_ONTOLOGY_NODES}, edges=${workingGraph.edges.length}/${MAX_ONTOLOGY_EDGES}).`,
+                    {
+                        bricks: totalBrickCount,
+                        nodes: workingGraph.nodes.length,
+                        edges: workingGraph.edges.length,
+                        limits: {
+                            maxBricks: MAX_ONTOLOGY_BRICKS,
+                            maxNodes: MAX_ONTOLOGY_NODES,
+                            maxEdges: MAX_ONTOLOGY_EDGES,
+                        },
+                    },
+                    tool
+                )
+            )
+        );
+    }
+
     // Step 1: Synchronize snapshot to HydraDB v0.4.0 when configured (`INV-HS-03` fast-trip fallback)
+    const clientConfigured = Boolean(
+        hydraClient && typeof hydraClient.isConfigured === 'function' && hydraClient.isConfigured()
+    );
     let hydraSync = {
-        configured: false,
+        configured: clientConfigured,
         liveSynced: false,
-        mode: 'embedded_graph_fallback',
+        mode: syncToHydra === false ? 'query_only_no_sync' : 'embedded_graph_fallback',
         nodesWritten: 0,
         edgesWritten: 0,
         cypherStatements: [],
         latencyMs: 0,
     };
 
-    const clientConfigured = Boolean(
-        hydraClient && typeof hydraClient.isConfigured === 'function' && hydraClient.isConfigured()
-    );
-    if (clientConfigured && typeof hydraClient.syncGraphSnapshot === 'function') {
+    if (syncToHydra !== false && clientConfigured && typeof hydraClient.syncGraphSnapshot === 'function') {
         try {
             const syncRes = await hydraClient.syncGraphSnapshot({
                 nodes: workingGraph.nodes,
                 edges: workingGraph.edges,
+                namespace: workingGraph.namespace,
             });
             const payload =
                 syncRes && isPlainObject(syncRes.data) ? syncRes.data : isPlainObject(syncRes) ? syncRes : {};
@@ -1757,7 +1990,7 @@ export async function syncAndQueryBrickOntology({
             const c = normalizeEntitySlug(edge.to, 'channel').toLowerCase();
             if (c && !prof.channels.includes(c)) prof.channels.push(c);
         } else if (edge.type === 'ROUTES_TO_MODEL') {
-            const m = normalizeEntitySlug(edge.to, 'moe').toLowerCase();
+            const m = normalizeMoeSlug(edge.to);
             if (m && !prof.moeProfiles.includes(m)) prof.moeProfiles.push(m);
         } else if (edge.type === 'GOVERNS') {
             if (edge.to && !prof.governedTargetIds.includes(edge.to)) {
@@ -1779,12 +2012,13 @@ export async function syncAndQueryBrickOntology({
     const collisionKeys = new Set();
     const recordCollision = (entry) => {
         const key = `${entry.producerId || entry.brickId}|${entry.producedPort}|${entry.consumedPort}|${entry.consumerId || 'query'}`;
-        if (!collisionKeys.has(key)) {
+        if (!collisionKeys.has(key) && blockedPortCollisions.length < MAX_TWO_HOP_COMPOSITIONS) {
             collisionKeys.add(key);
             blockedPortCollisions.push(entry);
         }
     };
 
+    const lowerQuery = cleanQuery.toLowerCase();
     const scoreLexical = (prof) => {
         if (queryTokens.length === 0) return 0;
         const haystack = [
@@ -1800,7 +2034,6 @@ export async function syncAndQueryBrickOntology({
         ]
             .join(' ')
             .toLowerCase();
-        const lowerQuery = cleanQuery.toLowerCase();
         let score = 0;
         if (prof.brickId && lowerQuery.includes(prof.brickId.toLowerCase())) {
             score += 60;
@@ -1813,9 +2046,15 @@ export async function syncAndQueryBrickOntology({
         return score;
     };
 
+    /** @type {Map<string, number>} */
+    const lexicalScoreById = new Map();
+    for (const prof of profileByBrickNodeId.values()) {
+        lexicalScoreById.set(prof.id, scoreLexical(prof));
+    }
+
     const oneHopMatches = [];
     for (const prof of profileByBrickNodeId.values()) {
-        if (cleanStack && prof.stacks.length > 0 && !prof.stacks.includes(cleanStack)) {
+        if (cleanStack && !prof.stacks.includes(cleanStack)) {
             continue;
         }
 
@@ -1849,7 +2088,7 @@ export async function syncAndQueryBrickOntology({
             continue;
         }
 
-        const lexScore = scoreLexical(prof);
+        const lexScore = lexicalScoreById.get(prof.id) || 0;
         if (!hasStructuralFilter && queryTokens.length > 0 && lexScore <= 0) {
             continue;
         }
@@ -1886,102 +2125,150 @@ export async function syncAndQueryBrickOntology({
         (a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
     );
 
-    // Step 5: Discover 2-hop composable pipelines (`producer --[:PRODUCES_PORT]-> port <--[:CONSUMES_PORT]-- consumer`)
-    const twoHopCompositions = [];
+    // Step 5: Discover bounded 2-hop composable pipelines (`producer --[:PRODUCES_PORT]-> port <--[:CONSUMES_PORT]-- consumer`)
+    const compareCompositionOrder = (a, b) =>
+        b.score - a.score ||
+        (a.producerId < b.producerId ? -1 : a.producerId > b.producerId ? 1 : 0) ||
+        (a.consumerId < b.consumerId ? -1 : a.consumerId > b.consumerId ? 1 : 0) ||
+        (a.portSlug < b.portSlug ? -1 : a.portSlug > b.portSlug ? 1 : 0);
+
+    let twoHopCompositions = [];
     if (effectiveMaxHops >= 2) {
-        const profiles = [...profileByBrickNodeId.values()];
-        for (const producer of profiles) {
-            if (cleanStack && producer.stacks.length > 0 && !producer.stacks.includes(cleanStack)) {
-                continue;
+        const eligibleProfiles = [...profileByBrickNodeId.values()].filter(
+            (prof) => !cleanStack || prof.stacks.includes(cleanStack)
+        );
+        eligibleProfiles.sort(
+            (a, b) =>
+                (lexicalScoreById.get(b.id) || 0) - (lexicalScoreById.get(a.id) || 0) ||
+                (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+        );
+
+        /** @type {Map<string, Array<{ consumer: any, inPort: string }>>} */
+        const consumersByLocalPort = new Map();
+        for (const consumer of eligibleProfiles) {
+            for (const inPort of consumer.consumesPorts) {
+                const parsedIn = parsePortScope(inPort);
+                if (!parsedIn.localName) continue;
+                let bucket = consumersByLocalPort.get(parsedIn.localName);
+                if (!bucket) {
+                    bucket = [];
+                    consumersByLocalPort.set(parsedIn.localName, bucket);
+                }
+                bucket.push({ consumer, inPort });
             }
-            for (const consumer of profiles) {
-                if (producer.id === consumer.id) continue;
-                if (cleanStack && consumer.stacks.length > 0 && !consumer.stacks.includes(cleanStack)) {
-                    continue;
-                }
-                if (
-                    cleanChannel &&
-                    !producer.channels.includes(cleanChannel) &&
-                    !consumer.channels.includes(cleanChannel)
-                ) {
-                    continue;
-                }
+        }
 
-                for (const outPort of producer.producesPorts) {
-                    for (const inPort of consumer.consumesPorts) {
-                        const cmp = compareDataPorts(outPort, inPort);
-                        if (cmp.collision) {
-                            recordCollision({
-                                producerId: producer.id,
-                                consumerId: consumer.id,
-                                producedPort: outPort,
-                                consumedPort: inPort,
-                                reason: cmp.reason,
-                            });
-                            continue;
-                        }
-                        if (!cmp.match) continue;
+        let floorItem = null;
+        for (const producer of eligibleProfiles) {
+            const producerLex = lexicalScoreById.get(producer.id) || 0;
+            const producerHasChannel = cleanChannel ? producer.channels.includes(cleanChannel) : true;
 
+            for (const outPort of producer.producesPorts) {
+                const parsedOut = parsePortScope(outPort);
+                if (!parsedOut.localName) continue;
+                const candidates = consumersByLocalPort.get(parsedOut.localName);
+                if (!candidates) continue;
+
+                for (const { consumer, inPort } of candidates) {
+                    if (producer.id === consumer.id) continue;
+                    if (
+                        cleanChannel &&
+                        !producerHasChannel &&
+                        !consumer.channels.includes(cleanChannel)
+                    ) {
+                        continue;
+                    }
+
+                    const cmp = compareDataPorts(outPort, inPort);
+                    if (cmp.collision) {
+                        recordCollision({
+                            producerId: producer.id,
+                            consumerId: consumer.id,
+                            producedPort: outPort,
+                            consumedPort: inPort,
+                            reason: cmp.reason,
+                        });
+                        continue;
+                    }
+                    if (!cmp.match) continue;
+
+                    const pairLex = producerLex + (lexicalScoreById.get(consumer.id) || 0);
+                    if (!hasStructuralFilter && queryTokens.length > 0 && pairLex <= 0) {
+                        continue;
+                    }
+
+                    let satisfiedRequired = [];
+                    if (cleanRequiredPorts.length > 0) {
                         const pipelinePorts = uniqueSafeStrings([
                             ...producer.consumesPorts,
                             ...producer.producesPorts,
                             ...consumer.consumesPorts,
                             ...consumer.producesPorts,
                         ]);
-                        const satisfiedRequired = cleanRequiredPorts.filter((req) =>
+                        satisfiedRequired = cleanRequiredPorts.filter((req) =>
                             pipelinePorts.some((pp) => compareDataPorts(pp, req).match)
                         );
-                        if (cleanRequiredPorts.length > 0 && satisfiedRequired.length === 0) {
+                        if (satisfiedRequired.length === 0) {
                             continue;
                         }
+                    }
 
-                        const pairLex = scoreLexical(producer) + scoreLexical(consumer);
-                        if (!hasStructuralFilter && queryTokens.length > 0 && pairLex <= 0) {
-                            continue;
-                        }
+                    let compositionScore = 25 + pairLex + satisfiedRequired.length * 30;
+                    if (cleanChannel && producerHasChannel) {
+                        compositionScore += 30;
+                    }
+                    if (cleanStack) {
+                        compositionScore += 25;
+                    }
 
-                        let compositionScore = 25 + pairLex + satisfiedRequired.length * 30;
-                        if (cleanChannel && producer.channels.includes(cleanChannel)) {
-                            compositionScore += 30;
-                        }
-                        if (cleanStack) {
-                            compositionScore += 25;
-                        }
+                    if (
+                        floorItem &&
+                        (compositionScore < floorItem.score ||
+                            (compositionScore === floorItem.score && producer.id > floorItem.producerId) ||
+                            (compositionScore === floorItem.score &&
+                                producer.id === floorItem.producerId &&
+                                consumer.id > floorItem.consumerId))
+                    ) {
+                        continue;
+                    }
 
-                        const bridgePortId = `port:${outPort}`;
-                        twoHopCompositions.push({
-                            producerId: producer.id,
-                            consumerId: consumer.id,
-                            producerBrickId: producer.brickId,
-                            consumerBrickId: consumer.brickId,
-                            producerTitle: producer.title,
-                            consumerTitle: consumer.title,
-                            bridgePort: bridgePortId,
-                            portSlug: outPort,
-                            outputPorts: consumer.producesPorts,
-                            channels: uniqueSafeStrings([...producer.channels, ...consumer.channels]),
-                            stacks: uniqueSafeStrings([...producer.stacks, ...consumer.stacks]),
-                            satisfiedRequiredPorts: satisfiedRequired,
-                            path: [producer.id, bridgePortId, consumer.id],
-                            edges: [
-                                { from: producer.id, to: bridgePortId, type: 'PRODUCES_PORT' },
-                                { from: consumer.id, to: bridgePortId, type: 'CONSUMES_PORT' },
-                            ],
-                            hops: 2,
-                            score: compositionScore,
-                        });
+                    const bridgePortId = `port:${outPort}`;
+                    twoHopCompositions.push({
+                        producerId: producer.id,
+                        consumerId: consumer.id,
+                        producerBrickId: producer.brickId,
+                        consumerBrickId: consumer.brickId,
+                        producerTitle: producer.title,
+                        consumerTitle: consumer.title,
+                        bridgePort: bridgePortId,
+                        portSlug: outPort,
+                        outputPorts: consumer.producesPorts,
+                        channels: uniqueSafeStrings([...producer.channels, ...consumer.channels]),
+                        stacks: uniqueSafeStrings([...producer.stacks, ...consumer.stacks]),
+                        satisfiedRequiredPorts: satisfiedRequired,
+                        path: [producer.id, bridgePortId, consumer.id],
+                        edges: [
+                            { from: producer.id, to: bridgePortId, type: 'PRODUCES_PORT' },
+                            { from: consumer.id, to: bridgePortId, type: 'CONSUMES_PORT' },
+                        ],
+                        hops: 2,
+                        score: compositionScore,
+                    });
+
+                    if (twoHopCompositions.length >= MAX_TWO_HOP_COMPOSITIONS * 2) {
+                        twoHopCompositions.sort(compareCompositionOrder);
+                        twoHopCompositions.length = MAX_TWO_HOP_COMPOSITIONS;
+                        floorItem = twoHopCompositions[MAX_TWO_HOP_COMPOSITIONS - 1];
                     }
                 }
             }
         }
     }
 
-    twoHopCompositions.sort(
-        (a, b) =>
-            b.score - a.score ||
-            (a.producerId < b.producerId ? -1 : a.producerId > b.producerId ? 1 : 0) ||
-            (a.consumerId < b.consumerId ? -1 : a.consumerId > b.consumerId ? 1 : 0)
-    );
+    twoHopCompositions.sort(compareCompositionOrder);
+    if (twoHopCompositions.length > MAX_TWO_HOP_COMPOSITIONS) {
+        twoHopCompositions = twoHopCompositions.slice(0, MAX_TWO_HOP_COMPOSITIONS);
+    }
 
     // Step 6: Trace `:GOVERNS` -> downstream repository AST callers (`IMPACTS`, `READS_ENV`, reverse `IMPORTS`/`CALLS`)
     const seedBrickIds = new Set([
@@ -2049,14 +2336,7 @@ export async function syncAndQueryBrickOntology({
 
             const candidate = nodeById.get(nextRepoId);
             if (!candidate || !isOntologyNodeActiveAt(candidate, cleanAsOf, nodeById)) continue;
-            if (
-                candidate.kind === 'brick' ||
-                candidate.kind === 'stack' ||
-                candidate.kind === 'port' ||
-                candidate.kind === 'channel' ||
-                candidate.kind === 'moe_profile' ||
-                candidate.kind === 'org_profile'
-            ) {
+            if (ONTOLOGY_NODE_KINDS.has(candidate.kind)) {
                 continue;
             }
 
