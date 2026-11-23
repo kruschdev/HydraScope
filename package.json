@@ -1,6 +1,6 @@
 {
   "name": "hydrascope",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "HydraScope: Live Agent Context Layer (Skills, 64 MCP Tools, Resolved Entities & Code AST) Built on Self-Hosted HydraDB",
   "author": "kruschdev <kruschdev@users.noreply.github.com>",
@@ -52,14 +52,23 @@
   },
   "dependencies": {
     "@hydradb/selfgraph": "https://raw.githubusercontent.com/kruschdev/HydraScope/main/vendor/hydradb-selfgraph-0.2.1.tgz",
-    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/f83d665ae8eb5677cd3397af2238ee508815b811.tar.gz",
+    "@krusch/toolkit": "https://github.com/kruschdev/toolkit/archive/1e8ad458808af1bac30bd5aa145eb087d9b5315e.tar.gz"
+  },
+  "peerDependencies": {
+    "kuzu": ">=0.11"
+  },
+  "peerDependenciesMeta": {
+    "kuzu": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
     "kuzu": "^0.11.3"
   },
   "overrides": {
     "hono": "^4.13.19",
     "@hono/node-server": "^2.1.9",
-    "tar": "^7.5.21",
-    "uuid": "^11.1.1"
+    "tar": "^7.5.21"
   },
   "mcpName": "dev.krusch/hydrascope"
 }

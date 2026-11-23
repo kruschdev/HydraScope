@@ -1,5 +1,7 @@
 # HydraScope
 
+[![AddonAudit](https://addonaudit.com/badges/dev-krusch-hydrascope.svg)](https://addonaudit.com/addon/dev-krusch-hydrascope/) [![npm version](https://img.shields.io/npm/v/hydrascope?color=22c55e)](https://www.npmjs.com/package/hydrascope) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 **Live Agent Context Layer (Skills, 64 MCP Tool Definitions, Resolved Entities, and Multi-Hop AST/ADR Lineage) Built on Self-Hosted HydraDB (`v0.4.0`)**
 
 [**Launch Live Demo (`https://hydrascope.krusch.dev`)**](https://hydrascope.krusch.dev) · [**Watch Loom Walkthrough (`4m 45s`)**](https://www.loom.com/share/eb71cc14722b4e47a24cd95972261b59) · [**Read Architecture Write-Up (`krusch.dev`)**](https://krusch.dev/articles/hydrascope-agent-context-on-hydradb) · [**Read Ontology Triad Paper (`krusch.dev`)**](https://krusch.dev/articles/ontological-brick-exchange-deadbolt-common-ground-hydrascope)
@@ -128,6 +130,8 @@ Open `http://127.0.0.1:4190` to launch the 3-tab **HydraScope** UI:
 ```bash
 docker compose --profile hydradb up -d
 ```
+
+For zero-daemon embedded SelfGraph storage (`engine: "selfgraph"` with `KuzuStore`), install the optional peer dependency `kuzu` (`npm install kuzu`).
 
 ### CLI & Stdio MCP Server
 

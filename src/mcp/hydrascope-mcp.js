@@ -370,7 +370,7 @@ export function createHydraScopeMcp({ runtime, connect = false } = {}) {
         }
     };
 
-    return createMcpServer('hydrascope-mcp', '0.1.0', HYDRASCOPE_MCP_TOOLS, handleToolCall, {
+    return createMcpServer('hydrascope-mcp', '0.1.2', HYDRASCOPE_MCP_TOOLS, handleToolCall, {
         connect,
         strictTools: true
     });
