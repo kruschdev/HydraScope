@@ -80,15 +80,17 @@ function withMutationLock(fn) {
 
 async function ensureVectorIndex() {
     if (!activeVectorIndex) {
-        activeVectorIndex = await buildVectorIndex(activeGraph, { preferOllama: false });
+        const startRev = graphRevision;
+        const startGraph = activeGraph;
+        let built = await buildVectorIndex(startGraph, { preferOllama: false });
         if (
-            activeGraph.workspaceName === 'fintech-core' &&
-            graphRevision === 0 &&
+            startGraph.workspaceName === 'fintech-core' &&
+            startRev === 0 &&
             Array.isArray(EDGE_SNAPSHOT.fintechVectors1024) &&
-            EDGE_SNAPSHOT.fintechVectors1024.length === activeGraph.nodes.length
+            EDGE_SNAPSHOT.fintechVectors1024.length === startGraph.nodes.length
         ) {
-            activeVectorIndex = {
-                chunks: activeVectorIndex.chunks.map((c, idx) => ({
+            built = {
+                chunks: built.chunks.map((c, idx) => ({
                     ...c,
                     vector: EDGE_SNAPSHOT.fintechVectors1024[idx]
                 })),
@@ -97,6 +99,10 @@ async function ensureVectorIndex() {
                 builtAt: EDGE_SNAPSHOT.capturedAt
             };
         }
+        if (graphRevision === startRev && activeGraph === startGraph) {
+            activeVectorIndex = built;
+        }
+        return built;
     }
     return activeVectorIndex;
 }
@@ -437,9 +443,10 @@ export const router = createEdgeRouter({
             const totalRequests = Math.min(200, Math.max(8, Number(body?.totalRequests) || 64));
             const concurrency = Math.min(24, Math.max(1, Number(body?.concurrency) || 8));
             const t0 = performance.now();
+            const graphSnap = activeGraph;
             const scenariosSnap = activeScenarios.length > 0 ? activeScenarios : BENCHMARK_SCENARIOS;
             for (let i = 0; i < totalRequests; i += 1) {
-                checkAnswerable(activeGraph, scenariosSnap[i % scenariosSnap.length].query);
+                checkAnswerable(graphSnap, scenariosSnap[i % scenariosSnap.length].query);
             }
             epochCounter += totalRequests;
             const scale = totalRequests / 64;
@@ -651,7 +658,8 @@ export const router = createEdgeRouter({
                     scrubSensitiveStrings(EDGE_SNAPSHOT.selfGraphSample)
                 );
             }
-            const trav = await traverseStructuralContext(activeGraph, {
+            const graphSnap = activeGraph;
+            const trav = await traverseStructuralContext(graphSnap, {
                 query: prompt,
                 asOf: asOfCheck.value,
                 tokenBudget,
@@ -659,7 +667,7 @@ export const router = createEdgeRouter({
             });
             const traversed = trav.ok ? trav.data.traversedNodes : [];
             const idSet = new Set(traversed.map((n) => n.id));
-            const rels = activeGraph.edges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
+            const rels = graphSnap.edges.filter((e) => idSet.has(e.from) && idSet.has(e.to));
             return edgeOkEnvelope(
                 'hydrascope.selfgraph.retrieve',
                 `Retrieved ${traversed.length} entities and ${rels.length} relations via SelfGraph (${strategy}).`,
@@ -697,17 +705,18 @@ export const router = createEdgeRouter({
                 });
             }
             const until = body?.until ? String(body.until).trim() : new Date().toISOString();
-            const retired = activeGraph.nodes.filter((n) => n.retiredAt);
+            const graphSnap = activeGraph;
+            const retired = graphSnap.nodes.filter((n) => n.retiredAt);
             return edgeOkEnvelope(
                 'hydrascope.selfgraph.diff',
-                `Computed SelfGraph diff since ${since}: +${activeGraph.edges.length} / -${retired.length} relations.`,
+                `Computed SelfGraph diff since ${since}: +${graphSnap.edges.length} / -${retired.length} relations.`,
                 scrubSensitiveStrings({
                     since,
                     until,
-                    relations_added: activeGraph.edges,
+                    relations_added: graphSnap.edges,
                     relations_retired: retired,
                     relations_revised: [],
-                    entities_created: activeGraph.nodes,
+                    entities_created: graphSnap.nodes,
                     limitations: ['Deletes and merges are not visible.']
                 })
             );
